@@ -259,6 +259,7 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             started_child_engines: dict[int, GraphEngine] = {}
             started_child_engines_lock = Lock()
+            aborted_reasons: dict[int, str] = {}
             merged_usage_indexes: set[int] = set()
             future_to_index: dict[_ParallelIterationFuture, int] = {}
             for index, item in enumerate(iterator_list_value):
@@ -269,6 +270,7 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                     item=item,
                     started_child_engines=started_child_engines,
                     started_child_engines_lock=started_child_engines_lock,
+                    aborted_reasons=aborted_reasons,
                 )
                 future_to_index[future] = index
             for future in as_completed(future_to_index):
@@ -290,6 +292,8 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                         future_to_index=future_to_index,
                         outputs=outputs,
                         started_child_engines=started_child_engines,
+                        started_child_engines_lock=started_child_engines_lock,
+                        aborted_reasons=aborted_reasons,
                         usage_accumulator=usage_accumulator,
                         merged_usage_indexes=merged_usage_indexes,
                     )
@@ -308,6 +312,7 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
         item: object,
         started_child_engines: dict[int, "GraphEngine"],
         started_child_engines_lock: Lock,
+        aborted_reasons: dict[int, str],
     ) -> _ParallelIterationFuture:
         return executor.submit(
             self._execute_tracked_iteration_parallel,
@@ -315,6 +320,7 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
             item=item,
             started_child_engines=started_child_engines,
             started_child_engines_lock=started_child_engines_lock,
+            aborted_reasons=aborted_reasons,
         )
 
     def _handle_parallel_iteration_success(
@@ -346,6 +352,8 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
         future_to_index: Mapping[_ParallelIterationFuture, int],
         outputs: list[object],
         started_child_engines: Mapping[int, "GraphEngine"],
+        started_child_engines_lock: Lock,
+        aborted_reasons: dict[int, str],
         usage_accumulator: list[LLMUsage],
         merged_usage_indexes: set[int],
     ) -> Literal["handled", "reraise", "terminate"]:
@@ -360,6 +368,8 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                 future_to_index=future_to_index,
                 current_future=future,
                 started_child_engines=started_child_engines,
+                started_child_engines_lock=started_child_engines_lock,
+                aborted_reasons=aborted_reasons,
                 reason=str(error) or _DEFAULT_CHILD_ABORT_REASON,
             )
             self._drain_parallel_siblings(
@@ -431,15 +441,19 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
             tuple[float, list[GraphNodeEventBase], object | None, LLMUsage]
         ],
         started_child_engines: Mapping[int, "GraphEngine"],
+        started_child_engines_lock: Lock,
+        aborted_reasons: dict[int, str],
         reason: str,
     ) -> None:
         for future, index in future_to_index.items():
             if future == current_future:
                 continue
 
-            graph_engine = started_child_engines.get(index)
-            if graph_engine is not None:
-                graph_engine.request_abort(reason)
+            with started_child_engines_lock:
+                aborted_reasons[index] = reason
+                graph_engine = started_child_engines.get(index)
+                if graph_engine is not None:
+                    graph_engine.request_abort(reason)
 
             future.cancel()
 
@@ -482,10 +496,14 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
         item: object,
         started_child_engines: dict[int, "GraphEngine"],
         started_child_engines_lock: Lock,
+        aborted_reasons: dict[int, str],
     ) -> tuple[float, list[GraphNodeEventBase], object | None, LLMUsage]:
         graph_engine = self._create_graph_engine(index, item)
         with started_child_engines_lock:
             started_child_engines[index] = graph_engine
+            aborted_reason = aborted_reasons.get(index)
+            if aborted_reason is not None:
+                graph_engine.request_abort(aborted_reason)
 
         return self._execute_parallel_iteration_with_graph_engine(
             graph_engine=graph_engine,

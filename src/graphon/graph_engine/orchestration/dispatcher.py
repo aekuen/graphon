@@ -10,6 +10,7 @@ from graphon.graph_events.base import GraphNodeEventBase
 from graphon.graph_events.node import (
     NodeRunExceptionEvent,
     NodeRunFailedEvent,
+    NodeRunStreamChunkEvent,
     NodeRunSucceededEvent,
 )
 
@@ -32,6 +33,7 @@ class Dispatcher:
         NodeRunSucceededEvent,
         NodeRunFailedEvent,
         NodeRunExceptionEvent,
+        NodeRunStreamChunkEvent,
     )
 
     def __init__(
@@ -101,7 +103,7 @@ class Dispatcher:
                     self._event_queue.task_done()
                     self._process_commands(event)
                 except queue.Empty:
-                    time.sleep(0.1)
+                    self._process_commands()
 
             self._process_commands()
             if paused:

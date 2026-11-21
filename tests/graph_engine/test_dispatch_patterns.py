@@ -1,5 +1,8 @@
+import queue
+import threading
 from datetime import UTC, datetime
 from time import time
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,13 +15,20 @@ from graphon.graph_engine.entities.commands import (
     PauseCommand,
     UpdateVariablesCommand,
 )
+from graphon.graph_engine.event_management import EventManager
+from graphon.graph_engine.event_management.event_handlers import EventHandler
 from graphon.graph_engine.layers.execution_limits import (
     ExecutionLimitsLayer,
     LimitType,
 )
+from graphon.graph_engine.orchestration.dispatcher import Dispatcher
+from graphon.graph_engine.orchestration.execution_coordinator import (
+    ExecutionCoordinator,
+)
 from graphon.graph_engine.ready_queue.factory import create_ready_queue_from_state
 from graphon.graph_engine.ready_queue.protocol import ReadyQueueState
-from graphon.graph_events.node import NodeRunStartedEvent
+from graphon.graph_events.base import GraphNodeEventBase
+from graphon.graph_events.node import NodeRunStartedEvent, NodeRunStreamChunkEvent
 
 
 @pytest.mark.parametrize(
@@ -101,3 +111,68 @@ def test_execution_limits_layer_matches_subclassed_node_start_event() -> None:
     )
 
     assert layer.step_count == 1
+
+
+@pytest.mark.parametrize("stream_events", [False, True])
+def test_dispatcher_processes_commands_without_terminal_events(
+    stream_events: bool,
+) -> None:
+    completed = threading.Event()
+
+    class FakeCoordinator:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.execution_complete = False
+            self.paused = False
+            self.process_calls = 0
+
+        def process_commands(self) -> None:
+            self.process_calls += 1
+            if self.process_calls >= 2:
+                self.aborted = True
+
+        def check_scaling(self) -> None:
+            return
+
+        def mark_complete(self) -> None:
+            return
+
+        def mark_failed(self, error: Exception) -> None:
+            raise AssertionError(error) from error
+
+    event_queue: queue.Queue[GraphNodeEventBase] | MagicMock
+    if stream_events:
+        stream_event = NodeRunStreamChunkEvent(
+            id="node-run-1",
+            node_id="node-1",
+            node_type=BuiltinNodeTypes.CODE,
+            selector=["node-1", "text"],
+            chunk="chunk",
+        )
+        event_queue = MagicMock()
+
+        def fake_get(*_args: object, **kwargs: object) -> GraphNodeEventBase:
+            if kwargs.get("block") is False:
+                raise queue.Empty
+            return stream_event
+
+        event_queue.get.side_effect = fake_get
+    else:
+        event_queue = queue.Queue()
+
+    coordinator = FakeCoordinator()
+    event_emitter = MagicMock()
+    event_emitter.mark_complete.side_effect = completed.set
+    dispatcher = Dispatcher(
+        event_queue=cast(queue.Queue[GraphNodeEventBase], event_queue),
+        event_handler=cast(EventHandler, MagicMock()),
+        execution_coordinator=cast(ExecutionCoordinator, coordinator),
+        event_emitter=cast(EventManager, event_emitter),
+    )
+
+    dispatcher.start()
+    try:
+        assert completed.wait(timeout=2)
+        assert coordinator.process_calls >= 2
+    finally:
+        dispatcher.stop()
