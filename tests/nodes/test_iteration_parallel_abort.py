@@ -59,3 +59,25 @@ def test_abort_is_replayed_for_engine_registered_after_cancellation(
     registered_engine.request_abort.assert_called_once_with("stop sibling")
     late_engine.request_abort.assert_called_once_with("stop sibling")
     assert aborted_reasons == {1: "stop sibling", 2: "stop sibling"}
+
+
+def test_non_cancelled_sibling_usage_is_still_merged() -> None:
+    node = object.__new__(IterationNode)
+    current = MagicMock()
+    sibling = MagicMock(spec=Future)
+    sibling.cancelled.return_value = False
+    sibling.result.return_value = None
+    engine = MagicMock()
+    engine.graph_runtime_state.llm_usage = LLMUsage.from_metadata({"total_tokens": 7})
+    usage_accumulator = [LLMUsage.empty_usage()]
+
+    node._drain_parallel_siblings(
+        future_to_index={current: -1, sibling: 0},
+        current_future=current,
+        started_child_engines={0: engine},
+        usage_accumulator=usage_accumulator,
+        merged_usage_indexes=set(),
+    )
+
+    sibling.result.assert_called_once()
+    assert usage_accumulator[0].total_tokens == 7

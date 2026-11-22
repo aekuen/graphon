@@ -8,7 +8,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from typing import final, override
@@ -24,6 +24,7 @@ from graphon.graph_events.node import (
 )
 from graphon.node_events.base import NodeRunResult
 from graphon.nodes.base.node import Node
+from graphon.runtime.graph_runtime_state import GraphExecutionProtocol
 
 from .ready_queue import ReadyQueue
 
@@ -48,6 +49,7 @@ class Worker(threading.Thread):
         layers: Sequence[GraphEngineLayer],
         worker_id: int = 0,
         execution_context: AbstractContextManager[object] | None = None,
+        graph_execution: GraphExecutionProtocol | None = None,
     ) -> None:
         """Initialize worker thread.
 
@@ -58,6 +60,7 @@ class Worker(threading.Thread):
             layers: Graph engine layers for node execution hooks
             worker_id: Unique identifier for this worker
             execution_context: Optional execution context for context preservation
+            graph_execution: Execution state used for abort checkpoints
 
         """
         super().__init__(name=f"GraphWorker-{worker_id}", daemon=True)
@@ -66,6 +69,7 @@ class Worker(threading.Thread):
         self._graph = graph
         self._worker_id = worker_id
         self._execution_context = execution_context
+        self._graph_execution = graph_execution
         self._stop_event = threading.Event()
         self._layers = layers if layers is not None else []
         self._last_task_time = time.time()
@@ -74,6 +78,33 @@ class Worker(threading.Thread):
     def stop(self) -> None:
         """Signal the worker to stop processing."""
         self._stop_event.set()
+
+    def _is_aborted(self) -> bool:
+        return self._graph_execution is not None and self._graph_execution.aborted
+
+    def _consume_node_events(
+        self,
+        node: Node,
+        node_events: Iterable[GraphNodeEventBase],
+    ) -> GraphNodeEventBase | None:
+        result_event: GraphNodeEventBase | None = None
+        close = getattr(node_events, "close", None)
+        try:
+            for event in node_events:
+                if self._is_aborted():
+                    break
+                if (
+                    isinstance(event, NodeRunStartedEvent)
+                    and event.id == node.execution_id
+                ):
+                    self._current_node_started_at = event.start_at
+                self._event_queue.put(event)
+                if is_node_result_event(event):
+                    result_event = event
+        finally:
+            if close is not None:
+                close()
+        return result_event
 
     @property
     def is_idle(self) -> bool:
@@ -99,6 +130,8 @@ class Worker(threading.Thread):
         and pushes events to event_queue until stopped.
         """
         while not self._stop_event.is_set():
+            if self._is_aborted():
+                break
             # Try to get a node ID from the ready queue (with timeout)
             try:
                 node_id = self._ready_queue.get(timeout=0.1)
@@ -143,16 +176,7 @@ class Worker(threading.Thread):
             with self._execution_context:
                 self._invoke_node_run_start_hooks(node)
                 try:
-                    node_events = node.run()
-                    for event in node_events:
-                        if (
-                            isinstance(event, NodeRunStartedEvent)
-                            and event.id == node.execution_id
-                        ):
-                            self._current_node_started_at = event.start_at
-                        self._event_queue.put(event)
-                        if is_node_result_event(event):
-                            result_event = event
+                    result_event = self._consume_node_events(node, node.run())
                 except Exception as exc:
                     error = exc
                     raise
@@ -161,16 +185,7 @@ class Worker(threading.Thread):
         else:
             self._invoke_node_run_start_hooks(node)
             try:
-                node_events = node.run()
-                for event in node_events:
-                    if (
-                        isinstance(event, NodeRunStartedEvent)
-                        and event.id == node.execution_id
-                    ):
-                        self._current_node_started_at = event.start_at
-                    self._event_queue.put(event)
-                    if is_node_result_event(event):
-                        result_event = event
+                result_event = self._consume_node_events(node, node.run())
             except Exception as exc:
                 error = exc
                 raise

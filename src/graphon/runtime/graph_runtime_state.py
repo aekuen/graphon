@@ -6,7 +6,9 @@ from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+from weakref import WeakSet
 
 from pydantic import BaseModel, Field
 from pydantic_core import to_jsonable_python
@@ -450,6 +452,9 @@ class _GraphRuntimeBindings:
             execution_context if execution_context is not None else nullcontext(None)
         )
         self.child_engine_builder: ChildGraphEngineBuilderProtocol | None = None
+        self._child_engines: WeakSet[Any] = WeakSet()
+        self._child_engines_lock = Lock()
+        self._child_abort_reason: str | None = None
 
     def attach_graph(
         self,
@@ -498,6 +503,16 @@ class _GraphRuntimeBindings:
     ) -> None:
         self.child_engine_builder = builder
 
+    def abort_children(self, reason: str) -> None:
+        """Fan out abort to child engines created from this state."""
+        with self._child_engines_lock:
+            self._child_abort_reason = reason
+            children = tuple(self._child_engines)
+        for child in children:
+            request_abort = getattr(child, "request_abort", None)
+            if callable(request_abort):
+                request_abort(reason)
+
     def create_child_engine(
         self,
         *,
@@ -510,13 +525,18 @@ class _GraphRuntimeBindings:
             msg = "Child engine builder is not configured."
             raise ChildEngineBuilderNotConfiguredError(msg)
 
-        return self.child_engine_builder.build_child_engine(
+        child_engine = self.child_engine_builder.build_child_engine(
             workflow_id=workflow_id,
             graph_init_params=graph_init_params,
             parent_graph_runtime_state=self._runtime_state,
             root_node_id=root_node_id,
             variable_pool=variable_pool,
         )
+        with self._child_engines_lock:
+            self._child_engines.add(child_engine)
+            if self._child_abort_reason is not None:
+                child_engine.request_abort(self._child_abort_reason)
+        return child_engine
 
     def get_ready_queue(self) -> ReadyQueueProtocol:
         if self.ready_queue is None:
@@ -748,6 +768,9 @@ class GraphRuntimeState:  # noqa: PLR0904
         builder: ChildGraphEngineBuilderProtocol,
     ) -> None:
         self._bindings.bind_child_engine_builder(builder)
+
+    def abort_children(self, reason: str) -> None:
+        self._bindings.abort_children(reason)
 
     def create_child_engine(
         self,

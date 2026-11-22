@@ -12,6 +12,7 @@ from typing import final
 
 from graphon.graph.graph import Graph
 from graphon.graph_events.base import GraphNodeEventBase
+from graphon.runtime.graph_runtime_state import GraphExecutionProtocol
 
 from ..config import GraphEngineConfig
 from ..layers.base import GraphEngineLayer
@@ -39,6 +40,7 @@ class WorkerPool:
         layers: list[GraphEngineLayer],
         config: GraphEngineConfig,
         execution_context: AbstractContextManager[object] | None = None,
+        graph_execution: GraphExecutionProtocol | None = None,
     ) -> None:
         """Initialize the simple worker pool.
 
@@ -49,12 +51,14 @@ class WorkerPool:
             layers: Graph engine layers for node execution hooks
             config: GraphEngine worker pool configuration
             execution_context: Optional execution context for context preservation
+            graph_execution: Execution state used for abort checkpoints
 
         """
         self._ready_queue = ready_queue
         self._event_queue = event_queue
         self._graph = graph
         self._execution_context = execution_context
+        self._graph_execution = graph_execution
         self._layers = layers
         self._config = config
 
@@ -139,6 +143,7 @@ class WorkerPool:
             layers=self._layers,
             worker_id=worker_id,
             execution_context=self._execution_context,
+            graph_execution=self._graph_execution,
         )
 
         worker.start()

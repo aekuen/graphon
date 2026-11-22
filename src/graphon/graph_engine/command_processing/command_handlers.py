@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from typing import final, override
 
 from graphon.entities.pause_reason import SchedulingPause
@@ -17,14 +18,20 @@ logger = logging.getLogger(__name__)
 
 @final
 class AbortCommandHandler(CommandHandler[AbortCommand]):
+    def __init__(self, on_abort: Callable[[str], None] | None = None) -> None:
+        self._on_abort = on_abort
+
     @override
     def handle(
         self,
         command: AbortCommand,
         execution: GraphExecutionProtocol,
     ) -> None:
-        logger.debug("Aborting workflow %s: %s", execution.workflow_id, command.reason)
-        execution.abort(command.reason or "User requested abort")
+        reason = command.reason or "User requested abort"
+        logger.debug("Aborting workflow %s: %s", execution.workflow_id, reason)
+        execution.abort(reason)
+        if self._on_abort is not None:
+            self._on_abort(reason)
 
 
 @final

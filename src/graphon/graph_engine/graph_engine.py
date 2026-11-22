@@ -136,7 +136,7 @@ class GraphEngine:
         )
 
         # Register command handlers
-        abort_handler = AbortCommandHandler()
+        abort_handler = AbortCommandHandler(self._graph_runtime_state.abort_children)
         self._command_processor.register_handler(AbortCommand, abort_handler)
 
         pause_handler = PauseCommandHandler()
@@ -159,6 +159,7 @@ class GraphEngine:
             layers=self._layers,
             execution_context=self._graph_runtime_state.execution_context,
             config=self._config,
+            graph_execution=self._graph_execution,
         )
 
         # === Orchestration ===

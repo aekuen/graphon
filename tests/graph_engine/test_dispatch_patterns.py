@@ -117,8 +117,20 @@ def test_execution_limits_layer_matches_subclassed_node_start_event() -> None:
 def test_dispatcher_processes_commands_without_terminal_events(
     stream_events: bool,
 ) -> None:
+    """
+    验证 Dispatcher 在没有终态事件时也能走到收尾流程并通知事件层完成.
+
+    覆盖两条命令触发路径:
+    - 事件队列为空
+    - 队列里只有 NodeRunStreamChunkEvent, 不是终态事件
+
+    without_terminal_events 指没有终态事件:
+    NodeRunSucceededEvent / NodeRunFailedEvent / NodeRunExceptionEvent.
+    """
+    # 用作 dispatcher 线程与主线程之间的完成信号, 新建时为 unset。
     completed = threading.Event()
 
+    # 测试替身: 只记录命令处理次数, 第二次起置 aborted 让 dispatcher 退出循环。
     class FakeCoordinator:
         def __init__(self) -> None:
             self.aborted = False
@@ -138,10 +150,13 @@ def test_dispatcher_processes_commands_without_terminal_events(
             return
 
         def mark_failed(self, error: Exception) -> None:
+            # 异常路径不应被触发, 触发则立即暴露。
             raise AssertionError(error) from error
 
+    # 两种队列形态分别覆盖: stream chunk 与 queue.Empty 两条命令触发路径。
     event_queue: queue.Queue[GraphNodeEventBase] | MagicMock
     if stream_events:
+        # 只有流式事件, 没有终态事件; 它仍属于命令触发事件。
         stream_event = NodeRunStreamChunkEvent(
             id="node-run-1",
             node_id="node-1",
@@ -152,17 +167,23 @@ def test_dispatcher_processes_commands_without_terminal_events(
         event_queue = MagicMock()
 
         def fake_get(*_args: object, **kwargs: object) -> GraphNodeEventBase:
+            # 阻塞获取返回流式事件; 排空队列时的非阻塞获取返回 Empty。
             if kwargs.get("block") is False:
                 raise queue.Empty
             return stream_event
 
         event_queue.get.side_effect = fake_get
     else:
+        # 空队列: 依靠 queue.Empty 分支驱动命令处理。
         event_queue = queue.Queue()
 
     coordinator = FakeCoordinator()
     event_emitter = MagicMock()
+    # side_effect 在被 mock 方法调用时执行:
+    # 置位 completed 表示 dispatcher 已走到 finally。
+    # 注意它改变的是 Event 状态, mark_complete() 返回值仍是 None。
     event_emitter.mark_complete.side_effect = completed.set
+    # 注入替身; cast 只为满足静态类型, 不改变运行时对象。
     dispatcher = Dispatcher(
         event_queue=cast(queue.Queue[GraphNodeEventBase], event_queue),
         event_handler=cast(EventHandler, MagicMock()),
@@ -172,7 +193,14 @@ def test_dispatcher_processes_commands_without_terminal_events(
 
     dispatcher.start()
     try:
+        # 等待 finally 中的完成通知; 超时说明 dispatcher 没有正常收尾。
         assert completed.wait(timeout=2)
+        # 确认命令处理至少被驱动两次: 第二次置 aborted, 之后还有一次收尾调用。
+        # stream_events=False: 循环前调用一次, 计数为 1.
+        # 第一次 while 迭代走 queue.Empty 分支, 计数从 1 变 2, 并置 aborted=True.
+        # 第二次 while 迭代在顶部读到 aborted 后直接 break, 不再走 queue.Empty 分支.
+        # 循环结束后第 108 行再调用一次收尾, 计数变成 3.
         assert coordinator.process_calls >= 2
     finally:
+        # 即使断言失败也停止后台线程。
         dispatcher.stop()
