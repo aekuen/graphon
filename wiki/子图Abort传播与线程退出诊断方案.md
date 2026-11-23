@@ -1,21 +1,29 @@
 # 子图 Abort 传播与线程退出诊断方案
 
-> 状态：阶段一诊断能力已实现。第 1–12 节保留完整设计约束，第 13 节记录已落地范围与用法。
-> 目标：验证“线程启动 → 发送 abort 指令 → 哪些子图处理指令 → 哪些执行已退出 → 哪些仍未退出及原因”。
-> 范围：不依赖 debugger 栈帧；先用于隔离复现与单实例灰度；不改变取消、调度、usage 合并策略。
+> 状态：阶段一诊断能力已实现。第 1–12 节说明设计约束，第 13 节说明已实现的功能、用法和实测记录。
+> 目标：跟踪线程启动和 abort 传播，确认哪些子图已处理取消、哪些执行已退出，以及未退出的原因。
+> 范围：诊断方案不依赖调试器栈帧，先用于隔离复现与单实例灰度；不改变取消、调度和 usage 合并策略。第 8.1 节另提供手动断点排查方法。
 
-## 1. 结论与方案选择
+## 1. 方案选择与阅读指引
 
-采用两层诊断：
+诊断以生命周期事件为主，线程栈为辅：
 
-1. **生命周期事件记录作为主证据**：在真实发生的位置记录线程启动、命令入队、命令处理、子图终态、清理和线程退出，用关联标识还原过程。
-2. **按需全线程栈作为辅助证据**：出现超时或缺失阶段时，通过已确认注册成功的信号抓取线程栈，定位锁等待、Future 等待或外部调用阻塞。
+1. **生命周期事件**：在线程启动、命令入队和处理、子图终态、清理及线程退出的实际发生位置记录事件，再用关联标识还原过程。
+2. **全线程栈**：出现超时或某个阶段缺少记录时，按需抓栈，定位锁等待、`Future` 等待或外部调用阻塞。通过信号触发前，必须确认目标进程已成功注册该信号。
 
-不采用“仅用 `sitecustomize.py` 遍历局部变量，就能完整判断所有子图是否收到 abort”的承诺。事后快照不能恢复已经消失的栈帧、被回收的子图及历史命令；单个布尔值也不能证明线程已经停止。
+仅靠 `sitecustomize.py` 遍历局部变量，无法完整判断所有子图是否收到 abort。事后快照无法恢复已经消失的栈帧、被回收的子图或历史命令；一个布尔状态也不能证明线程已经停止。
 
-实现取舍：纯栈诊断可以通过独立启动注入实现；可靠的生命周期记录需要少量明确的源码观测点或等效的正式诊断接口。**不推荐用 monkey patch、全局 trace 或反射遍历来维持‘完全不改源码’的表象**，这些方式更加依赖内部结构，也更容易改变运行时行为。
+如果只需要抓栈，可以在启动时独立注入注册逻辑。要可靠地记录生命周期，则需要少量源码观测点或正式诊断接口。不建议为避免修改源码而使用 monkey patch、全局 trace 或反射遍历：这些方式更依赖内部结构，也更容易改变运行时行为。
 
-本文第 1–12 节仍是设计约束；阶段一实现见第 13 节。完整 request/cause 关联与多进程报告尚未实现。
+按排查需要阅读：
+
+- 先区分取消、清理和线程停止：看第 2–3 节。
+- 了解事件、日志和抓栈约束：看第 4–7 节。
+- 执行验证或设置断点：看第 8 节及第 8.1 节。
+- 判断结果、安排验收和回滚：看第 9–12 节。
+- 启用已有诊断功能、查看实测日志：直接看第 13 节。
+
+完整的 request/cause 关联与多进程报告尚未实现，不应把设计要求视为已有能力。
 
 ## 2. 必须分开的状态
 
@@ -32,7 +40,7 @@
 | 线程退出标记 | 线程目标函数已到达 finally 尾部 | OS 线程在标记写入的瞬间已经死亡 |
 | 线程确认停止 | join 返回后该 Thread 的 `is_alive()` 为 False | 外部服务请求已被供应商取消 |
 
-最终报告应同时呈现“取消处理状态”“图执行状态”“线程存活状态”，不要压缩成一个 success/failed 字段。
+报告需要分别回答三个问题：取消请求是否已处理、图执行到了哪个阶段、相关线程是否仍存活。不要用一个 `success/failed` 字段概括这三种状态。
 
 ## 3. 当前代码边界
 
@@ -146,7 +154,7 @@ dispatcher 的 stop 使用有限 join；worker pool 逐个有限 join，之后�
 
 ### 4.1 请求标识的实施边界
 
-当前命令未被本文假定为已支持上述 request ID。实施时必须选择并记录关联方式：
+上述 request ID 是设计要求，不能假定当前命令已经支持。实现时需要明确采用哪种关联方式，并记录其限制：
 
 - 若已有 trace metadata，优先复用；否则评审是否增加可选诊断 metadata，并验证内存/Redis 序列化兼容性。
 - 首期也可限制为“单 run、单次外部 abort”，只做 engine 级确认，明确不能准确区分并发重复 abort 请求。
@@ -156,7 +164,7 @@ dispatcher 的 stop 使用有限 join；worker pool 逐个有限 join，之后�
 
 ## 5. 需要记录的事件与位置
 
-所有事件名均为拟新增诊断事件，不是现有业务事件。
+本节列出设计要求中的诊断事件，它们与业务事件分开记录。阶段一已实现的事件见第 13.1 节；本节清单不代表全部已实现。
 
 ### 5.1 创建与线程启动
 
@@ -235,7 +243,9 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 - 限制总容量、单条大小和写入频率；文件权限仅允许必要用户读取，默认使用本地磁盘。
 - 退出时只做有限时间 flush；未落盘内容记为不完整，不通过无限等待阻止退出。
 
-记录事件应移到业务锁外；若某个观测点确实位于锁内，只提取必要的简单值，锁外提交。事件之间可能并发交错，分析应依赖关联键与因果阶段，而不是把文件行序当成全局执行顺序。
+尽量在业务锁外提交事件。如果观测点必须位于锁内，就只在锁内提取必要的简单值，释放锁后再提交。
+
+不同线程的事件可能交错写入。分析时应根据关联键和各阶段的因果关系还原过程，不能直接把日志文件的行序当成全局执行顺序。
 
 ### 6.2 隐私与对象生命周期
 
@@ -309,11 +319,11 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 ### 步骤四：观察退出
 
-为每个 child 等待或收集：worker 命中检查点、终态、run 清理、线程 join 结果、iteration task 返回、drain 进度。
+逐个收集子图的退出证据：worker 是否命中检查点、是否发出终态、`run()` 是否完成清理、线程 join 后是否仍存活，以及 iteration 任务返回情况和 drain 进度。
 
-设置可配置的观测窗口，例如首次观察 5 秒、第二次观察 30 秒。这只是诊断阈值，不是产品取消 SLA，也不是代码中的自动超时取消。超过窗口后继续保留观测，不强杀线程、不改 Future 状态。
+观测窗口应可配置，例如首次观察 5 秒、第二次观察 30 秒。这个时间只用于触发进一步排查，不代表产品取消 SLA，也不会自动取消执行。超过窗口后仍继续观测，不强杀线程、不修改 `Future` 状态。
 
-对 B：预期先看到 abort 已处理，但节点阻塞未解除，worker 可能仍 alive。抓栈后释放替身阻塞，再确认其最终退出。这能验证“已收到但未退出”分类是否可靠。
+场景 B 预期会先出现“abort 已处理，但节点仍阻塞”的状态，此时 worker 可能仍存活。先抓栈，再释放替身节点的阻塞，最后确认线程退出，以此验证“已收到但未退出”的分类是否准确。
 
 ### 步骤五：检查新一轮隔离
 
@@ -328,7 +338,9 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 ## 8.1 现有代码的断点与调试控制台操作
 
-本节可以在尚未实现生命周期诊断模块时使用。适用于隔离复现或已批准的调试实例，不建议直接暂停承载真实流量的共享进程。所有路径相对 `src/graphon/`，行号为本次核查位置，代码变化后按方法和语句重新定位。
+即使没有生命周期诊断模块，也可以用本节的断点和控制台表达式排查。仅用于隔离复现或已批准的调试实例，不建议暂停承载真实流量的共享进程。
+
+本节路径均相对 `src/graphon/`。行号对应编写时核查的源码版本；代码变化后，应按方法名和语句重新定位。
 
 ### 8.1.1 操作前须知
 
@@ -388,9 +400,13 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 `self.request_abort("debug-parent-abort")`
 
+这里 `self` 必须是 `GraphEngine`。别在 `GraphWorker-N.run` 帧执行这句；那个帧里的 `self` 是 `Worker`，没有 `request_abort()`，IDE 会报 `AttributeError: 'Worker' object has no attribute 'request_abort'`。
+
 **方式 B：只对某个 child 发请求。** 在 `_execute_tracked_iteration_parallel()` 第 508 行帧，核对 `index` 和 `id(graph_engine)` 后执行：
 
 `graph_engine.request_abort("debug-child-abort")`
+
+这里要在 iteration 子帧执行。若选到 `ThreadPoolExecutor-1_x` 的通用 `_worker` / `run` 帧，局部变量 `graph_engine` 不存在，会报 `NameError: name 'graph_engine' is not defined`。
 
 方式 B 不等价于验证外层取消；该 child 的 abort 可能触发 iteration 兄弟互撤。因此它也不保证只影响一个 iteration 项。
 
@@ -398,7 +414,7 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 此操作验证 engine 命令通道及后续链路，**不验证宿主 HTTP stop 接口、权限或 Redis 路由是否正确**。要验证那些入口，应从真实调用方发 stop，再在 handler 断点观察；本文不猜测宿主接口地址和请求体。
 
-禁止替代操作：直接赋值 `aborted=True`、调用 `execution.abort()` 或 `abort_children()` 来冒充完整命令传播；禁止通过 `future.cancel()`、清空 ready queue、再次调用 `run()` 人工制造通过结果。
+禁止替代操作：直接赋值 `aborted=True`、调用 `execution.abort()` 或 `abort_children()` 来冒充完整命令传播；禁止通过 `future.cancel()`、清空 ready queue、再次调用 `run()` 人工制造通过结果。只想看 abort 后的收尾行为时，可以用第 13.4 节的直接置位方法，但那不算命令传播验证。
 
 ### 8.1.5 第三步：检查哪些子图被发送、哪些已处理
 
@@ -478,9 +494,11 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 ### 8.1.9 与信号快照的关系
 
-上述调试控制台方法不需要安装诊断信号处理器，也不能证明处理器已安装。本文此前的生命周期模块与信号注册仍是待实现方案。
+调试控制台方法不依赖诊断信号处理器，也不能证明处理器已安装。阶段一已提供生命周期记录和信号注册能力，启用方式见第 13 节；目标进程是否实际启用，仍需单独核实。
 
-只有后续模块已实现、目标 PID 注册和信号占用均确认后，才在**系统终端**发送约定信号，例如约定 SIGUSR1 时使用 `kill -USR1 <已确认的PID>`。这不是 Python 调试控制台表达式，也不是业务 abort 指令。当前没有注册确认时不要执行，不要在控制台用 `os.kill()` 自信号来探测。
+确认目标 PID 已注册诊断信号、信号未被其他处理器占用后，才可在**系统终端**发送约定信号。例如，约定使用 SIGUSR1 时，命令为 `kill -USR1 <已确认的PID>`。这条命令用于抓栈，既不是 Python 调试控制台表达式，也不是业务 abort 指令。
+
+没有注册确认时不要发送信号，也不要在控制台用 `os.kill()` 向当前进程发信号来探测。
 
 ## 9. 报告格式与判定规则
 
@@ -507,7 +525,13 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 “哪些没有收到”应默认表述为“哪些未观测到处理”。只有链路证据完整且存在明确发送/处理失败，才给出对应确定结论。
 
-耗时分别统计：入队→状态设置、状态设置→终态、状态设置→线程确认停止。跨进程耗时不能直接相减各自的 monotonic 时钟；没有可靠时钟同步时只给进程内时差与跨进程因果关系。
+耗时分三段统计：
+
+- 入队 → 设置取消状态；
+- 设置取消状态 → 发出图终态；
+- 设置取消状态 → 确认线程停止。
+
+不同进程的 monotonic 时钟不能直接相减。没有可靠的时钟同步时，只报告进程内耗时，并说明跨进程事件的因果关系。
 
 ## 10. 验收与故障注入
 
@@ -552,7 +576,9 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 ### 回滚
 
-关闭诊断开关并按部署流程重启确认。清除启动环境注入时要恢复原 PYTHONPATH，而不是覆盖其他配置。若有运行时卸载能力，必须先注销信号再关闭其文件，并处理诊断写入线程；不得直接关闭仍被 faulthandler 使用的描述符。
+关闭诊断开关后，按部署流程重启并确认诊断已停用。若清除启动时注入的环境配置，应恢复原 `PYTHONPATH`，保留其他配置。
+
+如果支持运行时卸载，必须先注销信号，再关闭对应文件，同时处理诊断写入线程。不得直接关闭仍被 `faulthandler` 使用的文件描述符。
 
 回滚不删除项目 `.codebuddy`，不改变业务日志配置，不强行释放业务锁，不强杀运行中的节点线程。
 
@@ -598,6 +624,50 @@ export GRAPHON_TRACE_QUEUE_SIZE=10000
 export GRAPHON_TRACE_FLUSH_TIMEOUT=0.5
 ```
 
+这组 `export` 只作用于当前 shell。用 VSCode / CodeBuddy 的 F5 compound 时，Flask 和 Celery 是两个独立调试配置，环境变量不会自动互相继承。实测结果就是 Flask 拿到了 `GRAPHON_*`，Celery worker 没有。要让诊断覆盖真正执行 workflow 的进程，必须在 `launch.json` 的 `Celery Worker (Debug)` 配置里也加 `env`：
+
+```jsonc
+"env": {
+  "GRAPHON_TRACE_FILE": "/home/jackson/graphon/debug/graphon_trace.worker.jsonl",
+  "GRAPHON_TRACE_SIGNAL": "SIGUSR1",
+  "GRAPHON_TRACE_QUEUE_SIZE": "10000",
+  "GRAPHON_TRACE_FLUSH_TIMEOUT": "0.5"
+}
+```
+
+也可以不用 IDE，直接在终端把变量绑到 Celery 进程上。最省事的是命令前缀：
+
+```bash
+cd /home/jackson/ai-dify/api
+env GRAPHON_TRACE_FILE=/home/jackson/graphon/debug/graphon_trace.worker.jsonl \
+    GRAPHON_TRACE_SIGNAL=SIGUSR1 \
+    GRAPHON_TRACE_QUEUE_SIZE=10000 \
+    GRAPHON_TRACE_FLUSH_TIMEOUT=0.5 \
+    uv run celery -A app.celery worker -P solo <其余参数不变>
+```
+
+这些变量只传给这条命令及其子进程，不会污染当前 shell。
+
+另一种做法是把变量写进专用 env 文件，再让 `uv run` 读取：
+
+```bash
+# /home/jackson/graphon/debug/graphon.env
+GRAPHON_TRACE_FILE=/home/jackson/graphon/debug/graphon_trace.worker.jsonl
+GRAPHON_TRACE_SIGNAL=SIGUSR1
+GRAPHON_TRACE_QUEUE_SIZE=10000
+GRAPHON_TRACE_FLUSH_TIMEOUT=0.5
+```
+
+```bash
+cd /home/jackson/ai-dify/api
+uv run --env-file /home/jackson/graphon/debug/graphon.env \
+    celery -A app.celery worker -P solo <其余参数不变>
+```
+
+`uv run --env-file` 会把文件里的变量加载给这条命令。不用 `uv` 时，也可以在同一个 shell 里 `set -a; source /home/jackson/graphon/debug/graphon.env; set +a`，再启动 Celery。
+
+建议 Flask 和 Celery 用不同的日志文件，例如 `graphon_trace.jsonl` 给 API，`graphon_trace.worker.jsonl` 给 worker。这样看日志时不用靠 `pid` 和 `session_id` 区分两个进程。
+
 启动目标进程后，需要抓取全线程栈时在**系统终端**执行：
 
 ```bash
@@ -619,11 +689,11 @@ kill -USR1 <已确认注册的PID>
 - 离线自检：`tests/graph_engine/test_diagnostics.py`。
 - 本地验证：`make check` 与定向 `pytest` 全绿。
 
-### 13.4 调试台手动触发父图 abort
+### 13.4 调试记录：直接设置父图 abort 状态
 
-在 IDE 调试器中，帧里的 `self` 类型决定该调用哪个方法。
+本节保留直接设置 abort 状态后的实测现象。这种操作可以观察取消后的收尾行为，但绕过了命令发送和处理过程，不能代替第 8.1 节的完整传播验证。
 
-在 `GraphWorker-1.run` 帧里：
+调用前先确认当前栈帧中 `self` 的类型。以下操作发生在 `GraphWorker-1.run` 帧：
 
 ```python
 self._graph_execution.abort("debug-parent-abort")
@@ -635,11 +705,11 @@ self._graph_execution.abort("debug-parent-abort")
 - `Worker._is_aborted()` 判断的是 `self._graph_execution.aborted`；
 - 因此直接调用 `GraphExecution.abort()` 能立即把父图执行状态置为 aborted。
 
-其它可用调用位置：
+不同栈帧中的调用含义如下：
 
-- `GraphEngine` 帧：`self._graph_execution.abort("debug-parent-abort")`，走正式命令通道；
-- `ThreadPoolExecutor-N_M` 的 iteration 子帧：`graph_engine.request_abort("child debug reason")`，只中止该子图；
-- 调试时若需要让当前 worker 退出循环，可额外调用 `self._stop_event.set()`，但这只停 worker 循环，不等价于图级 abort。
+- `GraphEngine` 帧：`self._graph_execution.abort("debug-parent-abort")` 同样是直接设置执行状态，不经过命令通道。要验证正式命令通道，切到父 `GraphEngine.run()` 帧，按第 8.1.4 节执行 `self.request_abort()`。`Worker` 帧没有 `request_abort()`；那里只能直接改执行状态，见本节前面的说明。
+- `ThreadPoolExecutor-N_M` 的 iteration 子帧：`graph_engine.request_abort("child debug reason")` 向当前子图发送取消请求；该请求可能触发兄弟子图收尾，不能保证只影响这个子图。
+- `Worker` 帧：`self._stop_event.set()` 用于请求当前 worker 退出循环，不等价于图级 abort，也不能替代传播验证。
 
 已观察现象：
 
@@ -655,9 +725,9 @@ self._graph_execution.abort("debug-parent-abort")
 
 注意：若进程加载的是 `api/.venv/lib/python3.12/site-packages/graphon` 中的旧版本，而不是本仓库 `/home/jackson/graphon` 的新提交，则新的诊断事件不会出现在该进程日志中。
 
-### 13.5 判断 `ThreadPoolExecutor-1_x` 对应哪个 `GraphWorker`
+### 13.5 用执行对象 ID 关联 iteration 与父图
 
-`GraphWorker-N` 是图引擎自己的 worker 线程；`ThreadPoolExecutor-1_x` 是 Python 线程池为 iteration 子项创建的线程。两者名字里没有直接映射关系，但可以通过**父图执行对象 id** 对应。
+`GraphWorker-N` 是图引擎的 worker 线程，`ThreadPoolExecutor-1_x` 是 Python 线程池执行 iteration 子项的线程。线程名之间没有直接映射关系，需要先用父图执行对象 ID 确认它们是否属于同一次父图执行。
 
 在 `ThreadPoolExecutor-1_x` 的 `_execute_tracked_iteration_parallel()` 帧中，`self` 是 `IterationNode`，执行：
 
@@ -673,7 +743,7 @@ id(self.graph_runtime_state.graph_execution)
 id(self._graph_execution)
 ```
 
-哪个值与上面一致，哪个 `GraphWorker` 就是提交这个 iteration 的父 worker。
+执行对象 ID 一致，说明该 `GraphWorker` 与 iteration 属于同一次父图执行。多个 worker 可能共享这个 ID，因此还不能据此确定具体由哪个 worker 提交；进一步定位的方法见第 13.7 节。
 
 注意不要拿下面这个值去和 `GraphWorker` 比较：
 
@@ -718,11 +788,13 @@ jackson  3341605 3341580 96 15:29 pts/15   00:00:29 /home/jackson/ai-dify/api/.v
 - `/proc/3341605/environ` 有 `GRAPHON_*`，而 `/proc/3341580/environ` 没有；
 - worker 日志里记录的 `pid` 是 `3341605`。
 
-因此：
+这次实测中，执行 workflow 的是子进程 `3341605`，`3341580` 只是 launcher。确认信号注册成功后，抓栈信号应发给 `3341605`。
 
-> 真正执行 workflow 的是子进程 `3341605`。要发 `SIGUSR1` 抓全线程栈，应发给 `3341605`，不是 launcher `3341580`。
+这些 PID 只对应本次记录。重新启动后，应按上面的判据确认新 PID，不要直接复用日志中的数值。
 
-环境变量验证：
+**核对环境变量**
+
+检查执行进程是否收到诊断配置：
 
 ```bash
 tr '\0' '\n' < /proc/3341605/environ | grep '^GRAPHON_'
@@ -749,38 +821,13 @@ cat /home/jackson/ai-dify/api/.venv/lib/python3.12/site-packages/graphon-0.4.0.d
 {"url":"ssh://git.szkingdom.com/grkj/websuites/graphon","vcs_info":{"vcs":"git","commit_id":"8188be26a4b9c22bfd486056592891d184f9adf7"}}
 ```
 
-说明 venv 已加载带诊断功能的新提交。
+这次核对确认，虚拟环境中的安装包对应带诊断功能的新提交。
 
-**日志文件状态：**
+**本次记录停在哪个阶段**
 
-```text
-graphon_trace.jsonl             2 lines
-graphon_trace.stacks.txt        0 lines
-graphon_trace.worker.jsonl      2 lines
-graphon_trace.worker.stacks.txt 0 lines
-```
-
-两个 `.stacks.txt` 都是 0 字节，因为还没有向已注册 `SIGUSR1` 的进程发送信号。
-
-Flask API 进程日志 `graphon_trace.jsonl` 完整内容：
-
-```json
-{"session_id": "34a19b6a718c4832aa1d4a317b56521a", "pid": 3289100, "sequence": 0, "monotonic_ns": 427303225235293, "timestamp": 1795417454.2746778, "event": "trace_configured", "thread_name": "MainThread", "thread_ident": 123145426843456, "thread_native_id": 3289100, "file": "/home/jackson/graphon/debug/graphon_trace.jsonl", "queue_size": 10000}
-{"session_id": "34a19b6a718c4832aa1d4a317b56521a", "pid": 3289100, "sequence": 1, "monotonic_ns": 427303229215894, "timestamp": 1795417454.2786589, "event": "dump_registered", "thread_name": "MainThread", "thread_ident": 123145426843456, "thread_native_id": 3289100, "signal_name": "SIGUSR1", "file": "/home/jackson/graphon/debug/graphon_trace.stacks.txt"}
-```
-
-Celery worker 日志 `graphon_trace.worker.jsonl` 完整内容：
-
-```json
-{"session_id": "2b94c005018744f58049f4ad1f3aa976", "pid": 3341605, "sequence": 0, "monotonic_ns": 428827227990099, "timestamp": 1795418978.277433, "event": "trace_configured", "thread_name": "MainThread", "thread_ident": 132483961059136, "thread_native_id": 3341605, "file": "/home/jackson/graphon/debug/graphon_trace.worker.jsonl", "queue_size": 10000}
-{"session_id": "2b94c005018744f58049f4ad1f3aa976", "pid": 3341605, "sequence": 1, "monotonic_ns": 428827233000506, "timestamp": 1795418978.282443, "event": "dump_registered", "thread_name": "MainThread", "thread_ident": 132483961059136, "thread_native_id": 3341605, "signal_name": "SIGUSR1", "file": "/home/jackson/graphon/debug/graphon_trace.worker.stacks.txt"}
-```
-
-阶段状态：
-
-- 当前只有 `trace_configured` 和 `dump_registered`，说明诊断模块已启用、信号已注册；
-- 尚未触发 workflow，所以没有 `engine_created`、`abort_*`、`iteration_*`、`thread_*` 等生命周期事件；
-- 触发 workflow 后，worker 日志应明显增长；若要抓栈，执行 `kill -USR1 3341605`。
+- 日志中只有 `trace_configured` 和 `dump_registered`，说明诊断模块已启用、信号已注册。
+- 当时尚未触发 workflow，因此没有 `engine_created`、`abort_*`、`iteration_*`、`thread_*` 等生命周期事件。这种情况不能判断为事件采集失败。
+- 触发 workflow 后，应继续检查 worker 日志是否增长。本次进程已确认注册，可用 `kill -USR1 3341605` 抓栈；重启后须重新确认 PID 和注册状态。
 
 ### 13.7 GraphWorker 标识与共享父图执行对象
 
@@ -797,16 +844,16 @@ Celery worker 日志 `graphon_trace.worker.jsonl` 完整内容：
 (1, 'GraphWorker-1', 132482687034944, 132482764816800)
 ```
 
-解释：
+这四个值依次表示：
 
-- `_worker_id` 是 WorkerPool 内部分配的 worker 编号；
-- `self.name` 是线程名；
-- `self.ident` 是线程级标识；
-- `id(self._graph_execution)` 是父图执行对象 id。
+- `_worker_id`：`WorkerPool` 内部分配的 worker 编号；
+- `self.name`：线程名；
+- `self.ident`：线程标识；
+- `id(self._graph_execution)`：父图执行对象 ID。
 
-多个 `GraphWorker` 得到相同的 `id(self._graph_execution)` 是正常现象：同一个 WorkerPool 创建每个 Worker 时传入的是同一个 `graph_execution` 对象。这个 id 标识的是**父图执行 / WorkerPool**，不是单个 worker。
+同一个 `WorkerPool` 创建的所有 `Worker` 共用一个 `graph_execution` 对象，所以多个线程得到相同的执行对象 ID 是正常现象。这个 ID 用于关联父图执行，不能区分其中的单个 worker。
 
-因此：
+选择标识时，按要确认的问题区分：
 
 - 要区分单个 `GraphWorker`，用 `_worker_id`、`name`、`ident`；
 - 要判断某个 iteration 子任务属于哪个父图执行，用 `id(self._graph_execution)`；
