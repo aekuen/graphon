@@ -618,3 +618,213 @@ kill -USR1 <已确认注册的PID>
 - 不修改取消、调度、drain、usage 合并策略；不使用 monkey patch 或全局 trace。
 - 离线自检：`tests/graph_engine/test_diagnostics.py`。
 - 本地验证：`make check` 与定向 `pytest` 全绿。
+
+### 13.4 调试台手动触发父图 abort
+
+在 IDE 调试器中，帧里的 `self` 类型决定该调用哪个方法。
+
+在 `GraphWorker-1.run` 帧里：
+
+```python
+self._graph_execution.abort("debug-parent-abort")
+```
+
+原因：
+
+- 此帧里的 `self` 是 `Worker`，没有 `request_abort()`；
+- `Worker._is_aborted()` 判断的是 `self._graph_execution.aborted`；
+- 因此直接调用 `GraphExecution.abort()` 能立即把父图执行状态置为 aborted。
+
+其它可用调用位置：
+
+- `GraphEngine` 帧：`self._graph_execution.abort("debug-parent-abort")`，走正式命令通道；
+- `ThreadPoolExecutor-N_M` 的 iteration 子帧：`graph_engine.request_abort("child debug reason")`，只中止该子图；
+- 调试时若需要让当前 worker 退出循环，可额外调用 `self._stop_event.set()`，但这只停 worker 循环，不等价于图级 abort。
+
+已观察现象：
+
+- 在 `GraphWorker-1.run` 帧执行 `self._graph_execution.abort("debug-parent-abort")` 后，出现 `GraphRunAbortedEvent` 对应的异常路径；
+- 随后 `ThreadPoolExecutor-1_N` 子图线程逐个消失；
+- 最后 `GraphWorker-1` 也退出。
+
+解释：
+
+- 这说明父图 abort 状态已经被 worker / dispatcher 观察到，迭代子任务随 abort 路径收尾；
+- “线程消失”表示任务结束、线程不再存活，**不是被强制杀死**；
+- 调试器停在 `ready_queue.get(timeout=0.1)` 的 `_queue.Empty` 是正常轮询超时；若 IDE 勾选了 “Raised Exceptions”，需要在异常断点中取消 `_queue.Empty`，否则每次空队列轮询都会断下。
+
+注意：若进程加载的是 `api/.venv/lib/python3.12/site-packages/graphon` 中的旧版本，而不是本仓库 `/home/jackson/graphon` 的新提交，则新的诊断事件不会出现在该进程日志中。
+
+### 13.5 判断 `ThreadPoolExecutor-1_x` 对应哪个 `GraphWorker`
+
+`GraphWorker-N` 是图引擎自己的 worker 线程；`ThreadPoolExecutor-1_x` 是 Python 线程池为 iteration 子项创建的线程。两者名字里没有直接映射关系，但可以通过**父图执行对象 id** 对应。
+
+在 `ThreadPoolExecutor-1_x` 的 `_execute_tracked_iteration_parallel()` 帧中，`self` 是 `IterationNode`，执行：
+
+```python
+id(self.graph_runtime_state.graph_execution)
+```
+
+得到该 iteration 所在父图执行对象 id。
+
+在每个仍存活的 `GraphWorker-N.run` 帧中执行：
+
+```python
+id(self._graph_execution)
+```
+
+哪个值与上面一致，哪个 `GraphWorker` 就是提交这个 iteration 的父 worker。
+
+注意不要拿下面这个值去和 `GraphWorker` 比较：
+
+```python
+id(graph_engine._graph_execution)
+```
+
+这是**子图执行对象**，每个 iteration 子项都有独立的 `GraphExecution`；`GraphWorker` 持有的是父图执行对象。子图 id 与父 worker id 不一致是正常现象。
+
+如果调试器提示 `Unable to find thread for evaluation`，说明该线程已经结束、处于 stale 列表，或不是可求值上下文，并不代表表达式本身错误。先在明确活着的 `MainThread` 或 `GraphWorker-0` 帧里列出线程：
+
+```python
+import threading
+[(t.name, t.ident, t.is_alive()) for t in threading.enumerate() if "ThreadPoolExecutor" in t.name or "GraphWorker" in t.name]
+```
+
+如果需要稳定抓到某个 `ThreadPoolExecutor-1_x` 的帧，应在 `_execute_tracked_iteration_parallel()` 内提前下断点，等断点命中后再求值，而不是恢复执行后手动选择线程。
+
+### 13.6 识别真正的 Celery worker 子进程与日志验证
+
+F5 启动 compound 后，`ps -ef | grep celery | grep -v grep` 出现两个进程，按下列优先级判断哪个是真正执行 workflow 的进程。
+
+**判据优先级：**
+
+1. `graphon_trace.worker.jsonl` 中事件记录的 `pid`；
+2. `/proc/<pid>/environ` 是否存在 `GRAPHON_*` 环境变量；
+3. 父子进程关系与命令行形态；
+4. CPU 时间占比。
+
+实测进程信息：
+
+```text
+(dify-api) jackson@test:~/graphon$ ps -ef | grep celery | grep -v grep
+jackson  3341580 3159488  1 15:29 pts/15   00:00:00 /home/jackson/ai-dify/api/.venv/bin/python /home/jackson/.codebuddy-server-cn/extensions/ms-python.debugpy-2026.6.0-linux-x64/bundled/libs/debugpy/adapter/../../debugpy/launcher 33575 -- -m celery -A app.celery worker -P solo --without-gossip --without-mingle --loglevel INFO -Q dataset,priority_dataset,priority_pipeline,pipeline,mail,ops_trace,app_deletion,plugin,workflow_storage,conversation,dataset_summary,workflow,schedule_poller,schedule_executor,triggered_workflow_dispatcher,trigger_refresh_executor,trigger_refresh_publisher,retention,workflow_based_app_execution,api_token,celery
+jackson  3341605 3341580 96 15:29 pts/15   00:00:29 /home/jackson/ai-dify/api/.venv/bin/python -X frozen_modules=off /home/jackson/.codebuddy-server-cn/extensions/ms-python.debugpy-2026.6.0-linux-x64/bundled/libs/debugpy/adapter/../../debugpy/launcher/../../debugpy --connect 127.0.0.1:42849 --configure-qt none --adapter-access-token be43d40204a39fc9215976899f4257fca73a6bec7d267fe4f1c27d2fc96db0f9 -m celery -A app.celery worker -P solo --without-gossip --without-mingle --loglevel INFO -Q dataset,priority_dataset,priority_pipeline,pipeline,mail,ops_trace,app_deletion,plugin,workflow_storage,conversation,dataset_summary,workflow,schedule_poller,schedule_executor,triggered_workflow_dispatcher,trigger_refresh_executor,trigger_refresh_publisher,retention,workflow_based_app_execution,api_token,celery
+```
+
+解释：
+
+- `3341580` 的 PPID 是 IDE 服务进程，命令行是 `/debugpy/launcher 33575 -- -m celery ...`，CPU 时间几乎为 0，是 launcher；
+- `3341605` 的 PPID 是 `3341580`，命令行带 `--connect 127.0.0.1:42849 -m celery ...`，并且 CPU 占用约 96%，是实际运行 `app.celery` 的 Python 子进程；
+- `/proc/3341605/environ` 有 `GRAPHON_*`，而 `/proc/3341580/environ` 没有；
+- worker 日志里记录的 `pid` 是 `3341605`。
+
+因此：
+
+> 真正执行 workflow 的是子进程 `3341605`。要发 `SIGUSR1` 抓全线程栈，应发给 `3341605`，不是 launcher `3341580`。
+
+环境变量验证：
+
+```bash
+tr '\0' '\n' < /proc/3341605/environ | grep '^GRAPHON_'
+```
+
+输出：
+
+```text
+GRAPHON_TRACE_FILE=/home/jackson/graphon/debug/graphon_trace.worker.jsonl
+GRAPHON_TRACE_SIGNAL=SIGUSR1
+GRAPHON_TRACE_QUEUE_SIZE=10000
+GRAPHON_TRACE_FLUSH_TIMEOUT=0.5
+```
+
+安装包提交验证：
+
+```bash
+cat /home/jackson/ai-dify/api/.venv/lib/python3.12/site-packages/graphon-0.4.0.dist-info/direct_url.json
+```
+
+输出：
+
+```json
+{"url":"ssh://git.szkingdom.com/grkj/websuites/graphon","vcs_info":{"vcs":"git","commit_id":"8188be26a4b9c22bfd486056592891d184f9adf7"}}
+```
+
+说明 venv 已加载带诊断功能的新提交。
+
+**日志文件状态：**
+
+```text
+graphon_trace.jsonl             2 lines
+graphon_trace.stacks.txt        0 lines
+graphon_trace.worker.jsonl      2 lines
+graphon_trace.worker.stacks.txt 0 lines
+```
+
+两个 `.stacks.txt` 都是 0 字节，因为还没有向已注册 `SIGUSR1` 的进程发送信号。
+
+Flask API 进程日志 `graphon_trace.jsonl` 完整内容：
+
+```json
+{"session_id": "34a19b6a718c4832aa1d4a317b56521a", "pid": 3289100, "sequence": 0, "monotonic_ns": 427303225235293, "timestamp": 1795417454.2746778, "event": "trace_configured", "thread_name": "MainThread", "thread_ident": 123145426843456, "thread_native_id": 3289100, "file": "/home/jackson/graphon/debug/graphon_trace.jsonl", "queue_size": 10000}
+{"session_id": "34a19b6a718c4832aa1d4a317b56521a", "pid": 3289100, "sequence": 1, "monotonic_ns": 427303229215894, "timestamp": 1795417454.2786589, "event": "dump_registered", "thread_name": "MainThread", "thread_ident": 123145426843456, "thread_native_id": 3289100, "signal_name": "SIGUSR1", "file": "/home/jackson/graphon/debug/graphon_trace.stacks.txt"}
+```
+
+Celery worker 日志 `graphon_trace.worker.jsonl` 完整内容：
+
+```json
+{"session_id": "2b94c005018744f58049f4ad1f3aa976", "pid": 3341605, "sequence": 0, "monotonic_ns": 428827227990099, "timestamp": 1795418978.277433, "event": "trace_configured", "thread_name": "MainThread", "thread_ident": 132483961059136, "thread_native_id": 3341605, "file": "/home/jackson/graphon/debug/graphon_trace.worker.jsonl", "queue_size": 10000}
+{"session_id": "2b94c005018744f58049f4ad1f3aa976", "pid": 3341605, "sequence": 1, "monotonic_ns": 428827233000506, "timestamp": 1795418978.282443, "event": "dump_registered", "thread_name": "MainThread", "thread_ident": 132483961059136, "thread_native_id": 3341605, "signal_name": "SIGUSR1", "file": "/home/jackson/graphon/debug/graphon_trace.worker.stacks.txt"}
+```
+
+阶段状态：
+
+- 当前只有 `trace_configured` 和 `dump_registered`，说明诊断模块已启用、信号已注册；
+- 尚未触发 workflow，所以没有 `engine_created`、`abort_*`、`iteration_*`、`thread_*` 等生命周期事件；
+- 触发 workflow 后，worker 日志应明显增长；若要抓栈，执行 `kill -USR1 3341605`。
+
+### 13.7 GraphWorker 标识与共享父图执行对象
+
+在每个 `GraphWorker-N.run` 帧中执行：
+
+```python
+(self._worker_id, self.name, self.ident, id(self._graph_execution))
+```
+
+实测示例：
+
+```text
+(2, 'GraphWorker-2', 132482678642240, 132482764816800)
+(1, 'GraphWorker-1', 132482687034944, 132482764816800)
+```
+
+解释：
+
+- `_worker_id` 是 WorkerPool 内部分配的 worker 编号；
+- `self.name` 是线程名；
+- `self.ident` 是线程级标识；
+- `id(self._graph_execution)` 是父图执行对象 id。
+
+多个 `GraphWorker` 得到相同的 `id(self._graph_execution)` 是正常现象：同一个 WorkerPool 创建每个 Worker 时传入的是同一个 `graph_execution` 对象。这个 id 标识的是**父图执行 / WorkerPool**，不是单个 worker。
+
+因此：
+
+- 要区分单个 `GraphWorker`，用 `_worker_id`、`name`、`ident`；
+- 要判断某个 iteration 子任务属于哪个父图执行，用 `id(self._graph_execution)`；
+- 仅凭父图执行 id，不能把 `ThreadPoolExecutor-1_x` 精确绑定到某一个 `GraphWorker-N`。
+
+在 `ThreadPoolExecutor-1_x` 的 `_execute_tracked_iteration_parallel` 帧中执行：
+
+```python
+import threading
+id(self.graph_runtime_state.graph_execution), threading.current_thread().name, threading.current_thread().ident
+```
+
+若第一个值与某个 `GraphWorker` 的 `id(self._graph_execution)` 一致，说明该 iteration 属于同一个父图执行 / WorkerPool。
+
+若需要进一步确认具体是哪一个 `GraphWorker-N` 提交了该 iteration，应查看线程栈：包含 `IterationNode._execute`、`_execute_parallel_iterations` 或 `as_completed()` 的那个 `GraphWorker`，就是等待这批子 Future 的父 worker。
+
+实测补充：
+
+- 在 `ThreadPoolExecutor-1_1` 的 iteration 子帧执行 `graph_engine.request_abort("debug child abort")` 后，`GraphWorker` 与 `ThreadPoolExecutor` 均退出；
+- 这说明子图 abort 已经沿 `ChildGraphAbortedEvent` 传播到父 iteration，并触发兄弟子图收尾与 worker 退出；
+- 该现象可作为 abort 传播链路生效的运行时证据，但不等于线程被强制杀死，线程是因为任务收尾后退出。
