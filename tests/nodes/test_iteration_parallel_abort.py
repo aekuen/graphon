@@ -63,10 +63,9 @@ def test_abort_is_replayed_for_engine_registered_after_cancellation(
 
 def test_non_cancelled_sibling_usage_is_still_merged() -> None:
     node = object.__new__(IterationNode)
-    current = MagicMock()
-    sibling = MagicMock(spec=Future)
-    sibling.cancelled.return_value = False
-    sibling.result.return_value = None
+    current = Future()
+    sibling = Future()
+    sibling.set_result(None)
     engine = MagicMock()
     engine.graph_runtime_state.llm_usage = LLMUsage.from_metadata({"total_tokens": 7})
     usage_accumulator = [LLMUsage.empty_usage()]
@@ -75,9 +74,10 @@ def test_non_cancelled_sibling_usage_is_still_merged() -> None:
         future_to_index={current: -1, sibling: 0},
         current_future=current,
         started_child_engines={0: engine},
+        aborted_reasons={0: "stop sibling"},
         usage_accumulator=usage_accumulator,
         merged_usage_indexes=set(),
+        timeout_seconds=1.0,
     )
 
-    sibling.result.assert_called_once()
     assert usage_accumulator[0].total_tokens == 7

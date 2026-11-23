@@ -117,7 +117,7 @@ dispatcher 的 stop 使用有限 join；worker pool 逐个有限 join，之后�
 
 ### 3.4 iteration 与 usage
 
-兄弟取消不能中断已经运行的 Future。drain 对未取消 Future 调用无超时的 `result()`；executor 上下文退出也可能继续等待：
+兄弟取消不能中断已经运行的 Future。旧实现的 drain 对未取消 Future 调用无超时的 `result()`，executor 上下文退出也可能继续等待。当前修复已把主 iteration 等待与 abort 后 sibling drain 都改成有界 `wait()`，executor 退出使用 `shutdown(wait=False, cancel_futures=True)`：
 
 ```433:490:src/graphon/nodes/iteration/iteration_node.py
     def _abort_parallel_siblings(
@@ -126,7 +126,7 @@ dispatcher 的 stop 使用有限 join；worker pool 逐个有限 join，之后�
         ...
 ```
 
-保留 drain 能合并 child runtime 已累计的 usage，但不能补回未进入 runtime 的结果事件。本诊断不得跳过 drain、提前结束 future 等待或改变 usage 合并。
+保留 drain 能合并 child runtime 已累计的 usage，但不能补回未进入 runtime 的结果事件。超时按语义 A 处理：父 iteration 直接失败，未完成子任务留在后台，pending index 不写 `sibling_wait_end`，也不合并 usage。
 
 > 上述代码引用使用省略形式定位方法，不是可直接应用的补丁。
 
@@ -219,11 +219,12 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 ### 5.4 Future、drain 与 usage
 
-记录 `future_cancel_attempt/result`、`sibling_drain_begin`、`sibling_wait_begin/end`、`usage_merge_done`、`sibling_drain_end`。
+记录 `future_cancel_attempt/result`、`sibling_drain_begin`、`sibling_wait_begin/end`、`usage_merge_done`、`sibling_drain_end`，以及超时修复新增的 `parallel_wait_timeout`、`sibling_wait_timeout`、`sibling_drain_timeout`、`parallel_pending_abort`。
 
 - cancel 结果记录真实返回值，不将返回 False 写成“取消失败导致异常”；它可能只是任务已经运行或完成。
 - 每次 wait 记录 index 和 child engine，才能定位卡在哪个兄弟。
-- usage 仅记录已经存在的计数快照与合并 index，标注为“截至当前阶段已入账”。
+- 超时事件必须记录 `pending_indexes`、`timeout_seconds`、`elapsed_seconds`；未完成 index 不写 `sibling_wait_end`。
+- usage 仅记录已经存在的计数快照与合并 index，标注为“截至当前阶段已入账”；pending index 的 usage 不合并。
 - 不在信号处理器内调用 `Future.done()` 或 `cancelled()`；它们可能获取内部锁。
 - 不在日志写入过程中额外遍历可变的共享对象图；优先记录业务代码在当前位置已经持有的简单值。
 - parent usage 可能已包含 child usage，禁止把两者再次求和当实际费用。
@@ -321,7 +322,7 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 逐个收集子图的退出证据：worker 是否命中检查点、是否发出终态、`run()` 是否完成清理、线程 join 后是否仍存活，以及 iteration 任务返回情况和 drain 进度。
 
-观测窗口应可配置，例如首次观察 5 秒、第二次观察 30 秒。这个时间只用于触发进一步排查，不代表产品取消 SLA，也不会自动取消执行。超过窗口后仍继续观测，不强杀线程、不修改 `Future` 状态。
+观测窗口应可配置，例如首次观察 5 秒、第二次观察 30 秒。这个时间只用于触发进一步排查，不代表产品取消 SLA，也不会自动取消执行。超过窗口后仍继续观测，不强杀线程、不修改 `Future` 状态。它与有界等待修复中的 `GRAPHON_PARALLEL_ITERATION_WAIT_TIMEOUT` / `GRAPHON_PARALLEL_SIBLING_DRAIN_TIMEOUT` 是两个不同概念：前者是人工排查窗口，后者是产品执行策略。
 
 场景 B 预期会先出现“abort 已处理，但节点仍阻塞”的状态，此时 worker 可能仍存活。先抓栈，再释放替身节点的阻塞，最后确认线程退出，以此验证“已收到但未退出”的分类是否准确。
 
@@ -587,8 +588,9 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 - 取消是协作式的，不提供同步调用抢占，也不保证外部服务即时停止计费。
 - 诊断可能改变线程时序；即使关闭复杂 locals 采集，也不能保证零扰动。
 - 最佳努力日志允许丢弃，因此必须有 evidence incomplete 分类；不能把无记录等同于未发生。
-- 不重构 logging，不修改 drain/usage 策略，不修复本文暴露出的有限 join 或同步阻塞行为。
-- 不自动通过固定超时判定故障；超时只是进一步抓栈和排查的触发条件。
+- 诊断方案本身不重构 logging、不修改 join 策略，也不通过 monkey patch 改变业务代码。
+- 后续有界等待修复已改变 drain/usage 策略：超时后父 iteration 失败，pending index 不合并 usage；这与早期“只诊断、不修复”的阶段边界不同。
+- 人工排查超时只用于触发抓栈；产品执行超时由 `GRAPHON_PARALLEL_*_TIMEOUT` 控制，两者不可混用。
 - 完整 request/cause 关联、多进程精确报告、A/B/C/D 故障注入矩阵未实现，仍属于后续阶段。
 
 ---
@@ -610,11 +612,12 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
   - `terminal_emitted`、`run_cleanup_enter/done`；
   - `thread_start_requested/enter/target_exit/join_result`；
   - `iteration_task_enter/child_bound`；
-  - `future_cancel_attempt/result`、`sibling_drain_begin/wait_begin/wait_end/usage_merge_done/drain_end`。
+  - `future_cancel_attempt/result`、`sibling_drain_begin/wait_begin/wait_end/usage_merge_done/drain_end`；
+  - 有界等待超时：`parallel_wait_timeout`、`sibling_wait_timeout`、`sibling_drain_timeout`、`parallel_pending_abort`。
 
 ### 13.2 启用方式
 
-环境变量统一由 `src/graphon/diagnostics_config.py` 的 `DiagnosticsConfig` 读取，并在 `graphon/__init__.py` 集中导出。字段使用 `Field` 描述与类型校验，不在业务模块中散落 `os.getenv()`。
+诊断开关由 `src/graphon/diagnostics_config.py` 的 `DiagnosticsConfig` 读取，并在 `graphon/__init__.py` 集中导出。字段使用 `Field` 描述与类型校验。并行 iteration 的两个执行超时变量由 `src/graphon/nodes/iteration/iteration_node.py` 中的 `_timeout_from_env()` 读取；非正数、非有限值或非法字符串会回落到默认值，避免把诊断配置失败变成无界等待。
 
 ```bash
 export GRAPHON_TRACE_FILE=/home/jackson/graphon/debug/graphon_trace.jsonl
@@ -623,6 +626,15 @@ export GRAPHON_TRACE_SIGNAL=SIGUSR1
 export GRAPHON_TRACE_QUEUE_SIZE=10000
 export GRAPHON_TRACE_FLUSH_TIMEOUT=0.5
 ```
+
+并行 iteration 有界等待的两个变量不在 `DiagnosticsConfig` 中，默认值如下：
+
+```bash
+export GRAPHON_PARALLEL_ITERATION_WAIT_TIMEOUT=300
+export GRAPHON_PARALLEL_SIBLING_DRAIN_TIMEOUT=30
+```
+
+它们和 `GRAPHON_TRACE_*` 一样需要绑定到实际执行 workflow 的 Celery worker 进程，IDE 场景中同样要写进 `launch.json` 的 `env`。
 
 这组 `export` 只作用于当前 shell。用 VSCode / CodeBuddy 的 F5 compound 时，Flask 和 Celery 是两个独立调试配置，环境变量不会自动互相继承。实测结果就是 Flask 拿到了 `GRAPHON_*`，Celery worker 没有。要让诊断覆盖真正执行 workflow 的进程，必须在 `launch.json` 的 `Celery Worker (Debug)` 配置里也加 `env`：
 
@@ -685,7 +697,7 @@ kill -USR1 <已确认注册的PID>
 
 - 不记录 prompt、变量池、HTTP 内容、密钥、完整 reason 或任意对象 `repr()`。
 - 首期适用于单 run、单次外部 abort 的隔离复现；重复并发 abort 无法精确区分 request/cause。
-- 不修改取消、调度、drain、usage 合并策略；不使用 monkey patch 或全局 trace。
+- 阶段一诊断本身不修改取消、调度、drain、usage 合并策略，也不使用 monkey patch 或全局 trace。后续 13.8 的有界等待修复已按语义 A 调整 drain/usage 策略，不属于阶段一诊断能力。
 - 离线自检：`tests/graph_engine/test_diagnostics.py`。
 - 本地验证：`make check` 与定向 `pytest` 全绿。
 
@@ -757,7 +769,12 @@ id(graph_engine._graph_execution)
 
 ```python
 import threading
-[(t.name, t.ident, t.is_alive()) for t in threading.enumerate() if "ThreadPoolExecutor" in t.name or "GraphWorker" in t.name]
+
+[
+    (t.name, t.ident, t.is_alive())
+    for t in threading.enumerate()
+    if "ThreadPoolExecutor" in t.name or "GraphWorker" in t.name
+]
 ```
 
 如果需要稳定抓到某个 `ThreadPoolExecutor-1_x` 的帧，应在 `_execute_tracked_iteration_parallel()` 内提前下断点，等断点命中后再求值，而不是恢复执行后手动选择线程。
@@ -863,15 +880,68 @@ cat /home/jackson/ai-dify/api/.venv/lib/python3.12/site-packages/graphon-0.4.0.d
 
 ```python
 import threading
-id(self.graph_runtime_state.graph_execution), threading.current_thread().name, threading.current_thread().ident
+
+(
+    id(self.graph_runtime_state.graph_execution),
+    threading.current_thread().name,
+    threading.current_thread().ident,
+)
 ```
 
 若第一个值与某个 `GraphWorker` 的 `id(self._graph_execution)` 一致，说明该 iteration 属于同一个父图执行 / WorkerPool。
 
-若需要进一步确认具体是哪一个 `GraphWorker-N` 提交了该 iteration，应查看线程栈：包含 `IterationNode._execute`、`_execute_parallel_iterations` 或 `as_completed()` 的那个 `GraphWorker`，就是等待这批子 Future 的父 worker。
+若需要进一步确认具体是哪一个 `GraphWorker-N` 提交了该 iteration，应查看线程栈：包含 `IterationNode._execute`、`_execute_parallel_iterations` 或 `concurrent.futures.wait()` 的那个 `GraphWorker`，就是等待这批子 Future 的父 worker。旧版本栈里可能仍显示 `as_completed()`。
 
 实测补充：
 
 - 在 `ThreadPoolExecutor-1_1` 的 iteration 子帧执行 `graph_engine.request_abort("debug child abort")` 后，`GraphWorker` 与 `ThreadPoolExecutor` 均退出；
 - 这说明子图 abort 已经沿 `ChildGraphAbortedEvent` 传播到父 iteration，并触发兄弟子图收尾与 worker 退出；
 - 该现象可作为 abort 传播链路生效的运行时证据，但不等于线程被强制杀死，线程是因为任务收尾后退出。
+
+### 13.8 parallel iteration 有界等待修复（语义 A）
+
+本节记录对旧 Future 架构的修复。官方最新版已经把 iteration 并行执行移到 engine/container handler，不再在 `iteration_node.py` 中使用 `as_completed()` / `future.result()`；本次没有做官方全量架构迁移，只借鉴其“显式完成状态、错误状态、usage 累加”的思路，在本地 Future 架构上封住无界等待。
+
+修改位置：
+
+- `src/graphon/nodes/iteration/iteration_node.py`
+  - `_execute_parallel_iterations()`：主等待从 `as_completed()` 改为有界 `wait()`；executor 不再依赖上下文管理器隐式 `shutdown(wait=True)`。
+  - `_drain_parallel_siblings()`：sibling drain 从逐个无超时 `result()` 改为整轮有界等待。
+  - `_abort_future_indexes()` / `_abort_pending_parallel_iterations()`：共享 abort + cancel 逻辑。
+  - `_fail_parallel_wait_timeout()` / `_fail_sibling_drain_timeout()`：统一记录超时事件并抛出领域异常。
+- `src/graphon/nodes/iteration/exc.py`
+  - 新增 `ParallelIterationWaitTimeoutError` 与 `ParallelSiblingDrainTimeoutError`，均继承 `IterationNodeError`，复用 `_run()` 已有的失败事件路径。
+
+环境变量：
+
+- `GRAPHON_PARALLEL_ITERATION_WAIT_TIMEOUT`，默认 `300` 秒，控制主 iteration 等待。
+- `GRAPHON_PARALLEL_SIBLING_DRAIN_TIMEOUT`，默认 `30` 秒，控制 abort 后 sibling drain。
+
+非法值、非正数、非有限值都会回落到默认值。两个变量只控制业务执行预算，不改变诊断开关。
+
+改动前后行为对比：
+
+- 改动前：`as_completed()` 和 `future.result()` 可能无限等待；`ThreadPoolExecutor` 上下文退出还可能再次 `shutdown(wait=True)`；drain 中 `suppress(Exception)` 会吞掉异常并继续写 `sibling_wait_end`。
+- 改动后：主等待和 drain 都有总预算；超时会先对 pending child 做协作式 abort/cancel，再让父 iteration 失败；executor 退出是 `shutdown(wait=False, cancel_futures=True)`。
+
+语义 A 的边界：
+
+- 父 iteration 超时后直接失败，不会把 pending future 当作成功完成。
+- 未完成 index 不写 `sibling_wait_end`，只写 `sibling_wait_timeout`。
+- pending index 的 usage 不合并；已经完成并合并的 usage 保留，不回滚，也不重复合并。
+- 不强制杀死 Python 线程。未响应 abort 的子任务可能继续留在后台，直到自行结束或进程退出。
+- `sibling_drain_end` 只在整轮 drain 正常完成时写；超时写 `sibling_drain_timeout`。
+
+新增事件字段：
+
+- `parallel_wait_timeout`：`pending_indexes`、`pending_count`、`timeout_seconds`、`elapsed_seconds`。
+- `sibling_wait_timeout`：`iteration_index`、`abort_requested`、`cancelled`、`child_engine_id`、`child_execution_id`。
+- `sibling_drain_timeout`：`pending_indexes`、`pending_count`、`completed_indexes`、`merged_indexes`、`timeout_seconds`、`elapsed_seconds`。
+- `parallel_pending_abort` / `child_abort_targeted`：通过 `propagation="iteration_wait_timeout"` 区分主等待超时触发的 abort。
+
+测试：
+
+- `tests/nodes/test_iteration_parallel_abort.py`
+- `tests/nodes/test_iteration_parallel_timeout.py`
+
+测试全部使用 `Future`、`MagicMock` 和本地 fake executor，不连接真实数据库、Redis、模型服务或外部网络。

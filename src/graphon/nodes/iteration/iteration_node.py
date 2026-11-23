@@ -1,10 +1,20 @@
 import logging
+import math
+import os
+import time
 from collections.abc import Generator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import suppress
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, datetime
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Literal, NewType, assert_never, override
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NewType,
+    NoReturn,
+    assert_never,
+    override,
+)
 
 from typing_extensions import TypeIs
 
@@ -51,6 +61,8 @@ from .exc import (
     IterationIndexNotFoundError,
     IterationNodeError,
     IteratorVariableNotFoundError,
+    ParallelIterationWaitTimeoutError,
+    ParallelSiblingDrainTimeoutError,
     StartNodeIdNotFoundError,
 )
 
@@ -59,12 +71,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _DEFAULT_CHILD_ABORT_REASON = "child graph aborted"
+_PARALLEL_ITERATION_WAIT_TIMEOUT_ENV = "GRAPHON_PARALLEL_ITERATION_WAIT_TIMEOUT"
+_PARALLEL_SIBLING_DRAIN_TIMEOUT_ENV = "GRAPHON_PARALLEL_SIBLING_DRAIN_TIMEOUT"
+_DEFAULT_PARALLEL_ITERATION_WAIT_TIMEOUT = 300.0
+_DEFAULT_PARALLEL_SIBLING_DRAIN_TIMEOUT = 30.0
 
 EmptyArraySegment = NewType("EmptyArraySegment", ArraySegment)
 type _ParallelIterationResult = tuple[
     float, list[GraphNodeEventBase], object | None, LLMUsage
 ]
 type _ParallelIterationFuture = Future[_ParallelIterationResult]
+
+
+def _timeout_from_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return default
+    if value <= 0 or not math.isfinite(value):
+        return default
+    return value
 
 
 class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
@@ -247,7 +276,7 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                     datetime.now(UTC).replace(tzinfo=None) - iter_start_at
                 ).total_seconds()
 
-    def _execute_parallel_iterations(
+    def _execute_parallel_iterations(  # noqa: PLR0914
         self,
         iterator_list_value: Sequence[object],
         outputs: list[object],
@@ -256,8 +285,12 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
     ) -> Generator[GraphNodeEventBase | NodeEventBase, None, None]:
         outputs.extend([None] * len(iterator_list_value))
         max_workers = min(self.node_data.parallel_nums, len(iterator_list_value))
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        timeout_seconds = _timeout_from_env(
+            _PARALLEL_ITERATION_WAIT_TIMEOUT_ENV,
+            _DEFAULT_PARALLEL_ITERATION_WAIT_TIMEOUT,
+        )
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             started_child_engines: dict[int, GraphEngine] = {}
             started_child_engines_lock = Lock()
             aborted_reasons: dict[int, str] = {}
@@ -274,36 +307,69 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                     aborted_reasons=aborted_reasons,
                 )
                 future_to_index[future] = index
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                try:
-                    yield from self._handle_parallel_iteration_success(
-                        index=index,
-                        result=future.result(),
-                        outputs=outputs,
-                        iter_run_map=iter_run_map,
-                        usage_accumulator=usage_accumulator,
-                        merged_usage_indexes=merged_usage_indexes,
-                    )
-                except Exception as e:
-                    action = self._handle_parallel_iteration_exception(
-                        error=e,
-                        index=index,
-                        future=future,
-                        future_to_index=future_to_index,
-                        outputs=outputs,
+
+            pending_future_to_index = dict(future_to_index)
+            wait_started_at = time.monotonic()
+            while pending_future_to_index:
+                elapsed_seconds = time.monotonic() - wait_started_at
+                remaining_seconds = timeout_seconds - elapsed_seconds
+                if remaining_seconds <= 0:
+                    self._fail_parallel_wait_timeout(
+                        pending_future_to_index=pending_future_to_index,
                         started_child_engines=started_child_engines,
                         started_child_engines_lock=started_child_engines_lock,
                         aborted_reasons=aborted_reasons,
-                        usage_accumulator=usage_accumulator,
-                        merged_usage_indexes=merged_usage_indexes,
+                        timeout_seconds=timeout_seconds,
+                        elapsed_seconds=elapsed_seconds,
                     )
-                    if action == "reraise":
-                        raise
-                    if action == "terminate":
-                        raise IterationNodeError(str(e)) from e
 
-        self._finalize_parallel_outputs(outputs)
+                done, _ = wait(
+                    pending_future_to_index,
+                    timeout=remaining_seconds,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    self._fail_parallel_wait_timeout(
+                        pending_future_to_index=pending_future_to_index,
+                        started_child_engines=started_child_engines,
+                        started_child_engines_lock=started_child_engines_lock,
+                        aborted_reasons=aborted_reasons,
+                        timeout_seconds=timeout_seconds,
+                        elapsed_seconds=time.monotonic() - wait_started_at,
+                    )
+
+                for future in done:
+                    index = pending_future_to_index.pop(future)
+                    try:
+                        yield from self._handle_parallel_iteration_success(
+                            index=index,
+                            result=future.result(),
+                            outputs=outputs,
+                            iter_run_map=iter_run_map,
+                            usage_accumulator=usage_accumulator,
+                            merged_usage_indexes=merged_usage_indexes,
+                        )
+                    except Exception as e:
+                        action = self._handle_parallel_iteration_exception(
+                            error=e,
+                            index=index,
+                            future=future,
+                            future_to_index=future_to_index,
+                            outputs=outputs,
+                            started_child_engines=started_child_engines,
+                            started_child_engines_lock=started_child_engines_lock,
+                            aborted_reasons=aborted_reasons,
+                            usage_accumulator=usage_accumulator,
+                            merged_usage_indexes=merged_usage_indexes,
+                        )
+                        if action == "reraise":
+                            raise
+                        if action == "terminate":
+                            raise IterationNodeError(str(e)) from e
+
+            self._finalize_parallel_outputs(outputs)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _submit_parallel_iteration_task(
         self,
@@ -377,8 +443,13 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                 future_to_index=future_to_index,
                 current_future=future,
                 started_child_engines=started_child_engines,
+                aborted_reasons=aborted_reasons,
                 usage_accumulator=usage_accumulator,
                 merged_usage_indexes=merged_usage_indexes,
+                timeout_seconds=_timeout_from_env(
+                    _PARALLEL_SIBLING_DRAIN_TIMEOUT_ENV,
+                    _DEFAULT_PARALLEL_SIBLING_DRAIN_TIMEOUT,
+                ),
             )
             return "reraise"
 
@@ -434,22 +505,56 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
     def _abort_parallel_siblings(
         self,
         *,
-        future_to_index: Mapping[
-            Future[tuple[float, list[GraphNodeEventBase], object | None, LLMUsage]],
-            int,
-        ],
-        current_future: Future[
-            tuple[float, list[GraphNodeEventBase], object | None, LLMUsage]
-        ],
+        future_to_index: Mapping[_ParallelIterationFuture, int],
+        current_future: _ParallelIterationFuture,
         started_child_engines: Mapping[int, "GraphEngine"],
         started_child_engines_lock: Lock,
         aborted_reasons: dict[int, str],
         reason: str,
     ) -> None:
-        for future, index in future_to_index.items():
-            if future == current_future:
-                continue
+        target_future_to_index = {
+            future: index
+            for future, index in future_to_index.items()
+            if future != current_future
+        }
+        self._abort_future_indexes(
+            future_to_index=target_future_to_index,
+            started_child_engines=started_child_engines,
+            started_child_engines_lock=started_child_engines_lock,
+            aborted_reasons=aborted_reasons,
+            reason=reason,
+            propagation="iteration_sibling",
+        )
 
+    def _abort_pending_parallel_iterations(
+        self,
+        *,
+        pending_future_to_index: Mapping[_ParallelIterationFuture, int],
+        started_child_engines: Mapping[int, "GraphEngine"],
+        started_child_engines_lock: Lock,
+        aborted_reasons: dict[int, str],
+        reason: str,
+    ) -> None:
+        self._abort_future_indexes(
+            future_to_index=pending_future_to_index,
+            started_child_engines=started_child_engines,
+            started_child_engines_lock=started_child_engines_lock,
+            aborted_reasons=aborted_reasons,
+            reason=reason,
+            propagation="iteration_wait_timeout",
+        )
+
+    def _abort_future_indexes(
+        self,
+        *,
+        future_to_index: Mapping[_ParallelIterationFuture, int],
+        started_child_engines: Mapping[int, "GraphEngine"],
+        started_child_engines_lock: Lock,
+        aborted_reasons: dict[int, str],
+        reason: str,
+        propagation: Literal["iteration_sibling", "iteration_wait_timeout"],
+    ) -> None:
+        for future, index in future_to_index.items():
             with started_child_engines_lock:
                 aborted_reasons[index] = reason
                 graph_engine = started_child_engines.get(index)
@@ -468,7 +573,7 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                     child_execution_id=id(graph_execution)
                     if graph_execution is not None
                     else None,
-                    propagation="iteration_sibling",
+                    propagation=propagation,
                 )
                 if graph_engine is not None:
                     graph_engine.request_abort(reason)
@@ -486,27 +591,56 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                 cancelled=cancelled,
             )
 
+    def _fail_parallel_wait_timeout(
+        self,
+        *,
+        pending_future_to_index: Mapping[_ParallelIterationFuture, int],
+        started_child_engines: Mapping[int, "GraphEngine"],
+        started_child_engines_lock: Lock,
+        aborted_reasons: dict[int, str],
+        timeout_seconds: float,
+        elapsed_seconds: float,
+    ) -> NoReturn:
+        pending_indexes = sorted(pending_future_to_index.values())
+        trace(
+            "parallel_wait_timeout",
+            container_execution_id=id(self),
+            pending_indexes=pending_indexes,
+            pending_count=len(pending_indexes),
+            timeout_seconds=timeout_seconds,
+            elapsed_seconds=elapsed_seconds,
+        )
+        self._abort_pending_parallel_iterations(
+            pending_future_to_index=pending_future_to_index,
+            started_child_engines=started_child_engines,
+            started_child_engines_lock=started_child_engines_lock,
+            aborted_reasons=aborted_reasons,
+            reason=f"parallel iteration wait timed out after {timeout_seconds:g}s",
+        )
+        raise ParallelIterationWaitTimeoutError(pending_indexes, timeout_seconds)
+
     def _drain_parallel_siblings(
         self,
         *,
-        future_to_index: Mapping[
-            Future[tuple[float, list[GraphNodeEventBase], object | None, LLMUsage]],
-            int,
-        ],
-        current_future: Future[
-            tuple[float, list[GraphNodeEventBase], object | None, LLMUsage]
-        ],
+        future_to_index: Mapping[_ParallelIterationFuture, int],
+        current_future: _ParallelIterationFuture,
         started_child_engines: Mapping[int, "GraphEngine"],
+        aborted_reasons: Mapping[int, str],
         usage_accumulator: list[LLMUsage],
         merged_usage_indexes: set[int],
+        timeout_seconds: float,
     ) -> None:
-        trace("sibling_drain_begin", container_execution_id=id(self))
+        trace(
+            "sibling_drain_begin",
+            container_execution_id=id(self),
+            timeout_seconds=timeout_seconds,
+        )
+        drain_started_at = time.monotonic()
+        pending_future_to_index: dict[_ParallelIterationFuture, int] = {}
         for future, index in future_to_index.items():
-            if future == current_future:
+            if future == current_future or future.cancelled():
                 continue
-            if future.cancelled():
-                continue
-
+            pending_future_to_index[future] = index
             graph_engine = started_child_engines.get(index)
             graph_execution = (
                 getattr(graph_engine, "_graph_execution", None)
@@ -521,30 +655,122 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
                 child_execution_id=id(graph_execution)
                 if graph_execution is not None
                 else None,
-            )
-            with suppress(Exception):
-                future.result()
-            trace(
-                "sibling_wait_end",
-                container_execution_id=id(self),
-                iteration_index=index,
+                abort_requested=index in aborted_reasons,
+                timeout_seconds=timeout_seconds,
             )
 
-            if index in merged_usage_indexes:
-                continue
+        completed_indexes: list[int] = []
+        while pending_future_to_index:
+            elapsed_seconds = time.monotonic() - drain_started_at
+            remaining_seconds = timeout_seconds - elapsed_seconds
+            if remaining_seconds <= 0:
+                self._fail_sibling_drain_timeout(
+                    pending_future_to_index=pending_future_to_index,
+                    started_child_engines=started_child_engines,
+                    aborted_reasons=aborted_reasons,
+                    merged_usage_indexes=merged_usage_indexes,
+                    completed_indexes=completed_indexes,
+                    timeout_seconds=timeout_seconds,
+                    elapsed_seconds=elapsed_seconds,
+                )
 
-            self._merge_graph_engine_usage(
-                usage_accumulator=usage_accumulator,
-                graph_engine=graph_engine,
+            done, _ = wait(
+                pending_future_to_index,
+                timeout=remaining_seconds,
+                return_when=FIRST_COMPLETED,
             )
-            merged_usage_indexes.add(index)
+            if not done:
+                self._fail_sibling_drain_timeout(
+                    pending_future_to_index=pending_future_to_index,
+                    started_child_engines=started_child_engines,
+                    aborted_reasons=aborted_reasons,
+                    merged_usage_indexes=merged_usage_indexes,
+                    completed_indexes=completed_indexes,
+                    timeout_seconds=timeout_seconds,
+                    elapsed_seconds=time.monotonic() - drain_started_at,
+                )
+
+            for future in done:
+                index = pending_future_to_index.pop(future)
+                if future.cancelled():
+                    continue
+                try:
+                    future.result()
+                except Exception:
+                    logger.debug(
+                        "parallel sibling future completed with exception",
+                        exc_info=True,
+                    )
+                trace(
+                    "sibling_wait_end",
+                    container_execution_id=id(self),
+                    iteration_index=index,
+                )
+                completed_indexes.append(index)
+
+                if index in merged_usage_indexes:
+                    continue
+
+                self._merge_graph_engine_usage(
+                    usage_accumulator=usage_accumulator,
+                    graph_engine=started_child_engines.get(index),
+                )
+                merged_usage_indexes.add(index)
+                trace(
+                    "usage_merge_done",
+                    container_execution_id=id(self),
+                    iteration_index=index,
+                    merged_indexes=len(merged_usage_indexes),
+                )
+
+        trace(
+            "sibling_drain_end",
+            container_execution_id=id(self),
+            completed_indexes=completed_indexes,
+            elapsed_seconds=time.monotonic() - drain_started_at,
+        )
+
+    def _fail_sibling_drain_timeout(
+        self,
+        *,
+        pending_future_to_index: Mapping[_ParallelIterationFuture, int],
+        started_child_engines: Mapping[int, "GraphEngine"],
+        aborted_reasons: Mapping[int, str],
+        merged_usage_indexes: set[int],
+        completed_indexes: Sequence[int],
+        timeout_seconds: float,
+        elapsed_seconds: float,
+    ) -> NoReturn:
+        pending_indexes = sorted(pending_future_to_index.values())
+        for future, index in pending_future_to_index.items():
+            graph_engine = started_child_engines.get(index)
+            graph_execution = (
+                getattr(graph_engine, "_graph_execution", None)
+                if graph_engine is not None
+                else None
+            )
             trace(
-                "usage_merge_done",
+                "sibling_wait_timeout",
                 container_execution_id=id(self),
                 iteration_index=index,
-                merged_indexes=len(merged_usage_indexes),
+                child_engine_id=id(graph_engine) if graph_engine is not None else None,
+                child_execution_id=id(graph_execution)
+                if graph_execution is not None
+                else None,
+                abort_requested=index in aborted_reasons,
+                cancelled=future.cancelled(),
             )
-        trace("sibling_drain_end", container_execution_id=id(self))
+        trace(
+            "sibling_drain_timeout",
+            container_execution_id=id(self),
+            pending_indexes=pending_indexes,
+            pending_count=len(pending_indexes),
+            completed_indexes=list(completed_indexes),
+            merged_indexes=len(merged_usage_indexes),
+            timeout_seconds=timeout_seconds,
+            elapsed_seconds=elapsed_seconds,
+        )
+        raise ParallelSiblingDrainTimeoutError(pending_indexes, timeout_seconds)
 
     def _execute_tracked_iteration_parallel(
         self,
