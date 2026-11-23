@@ -11,6 +11,7 @@ import queue
 from collections.abc import Generator
 from typing import final
 
+from graphon.diagnostics import trace
 from graphon.entities.graph_init_params import GraphInitParams
 from graphon.entities.workflow_start_reason import WorkflowStartReason
 from graphon.enums import NodeExecutionType
@@ -89,6 +90,12 @@ class GraphEngine:
         # Graph execution tracks the overall execution state
         self._graph_execution = self._graph_runtime_state.graph_execution
         self._graph_execution.workflow_id = workflow_id
+        trace(
+            "engine_created",
+            engine_id=id(self),
+            execution_id=id(self._graph_execution),
+            workflow_id=workflow_id,
+        )
 
         # === Execution Queues ===
         self._ready_queue = self._graph_runtime_state.ready_queue
@@ -224,8 +231,28 @@ class GraphEngine:
 
     def request_abort(self, reason: str | None = None) -> None:
         """Queue an abort command for this engine."""
-        self._command_channel.send_command(
-            AbortCommand(reason=reason or "User requested abort"),
+        trace(
+            "abort_send_attempt",
+            engine_id=id(self),
+            execution_id=id(self._graph_execution),
+            workflow_id=self._graph_execution.workflow_id,
+        )
+        try:
+            self._command_channel.send_command(
+                AbortCommand(reason=reason or "User requested abort"),
+            )
+        except Exception as error:
+            trace(
+                "abort_enqueue_failed",
+                engine_id=id(self),
+                execution_id=id(self._graph_execution),
+                error_type=type(error).__name__,
+            )
+            raise
+        trace(
+            "abort_enqueue_ok",
+            engine_id=id(self),
+            execution_id=id(self._graph_execution),
         )
 
     def create_child_engine(
@@ -288,7 +315,19 @@ class GraphEngine:
             raise
 
         finally:
-            self._stop_execution()
+            trace(
+                "run_cleanup_enter",
+                engine_id=id(self),
+                execution_id=id(self._graph_execution),
+            )
+            try:
+                self._stop_execution()
+            finally:
+                trace(
+                    "run_cleanup_done",
+                    engine_id=id(self),
+                    execution_id=id(self._graph_execution),
+                )
 
     def _emit_terminal_events(self) -> Generator[GraphEngineEvent, None, None]:
         if self._graph_execution.is_paused:
@@ -314,6 +353,12 @@ class GraphEngine:
                 outputs=self._graph_runtime_state.outputs,
             )
             self._event_manager.notify_layers(aborted_event)
+            trace(
+                "terminal_emitted",
+                engine_id=id(self),
+                execution_id=id(self._graph_execution),
+                terminal="aborted",
+            )
             yield aborted_event
             return
 

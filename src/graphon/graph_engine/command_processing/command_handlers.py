@@ -2,6 +2,7 @@ import logging
 from collections.abc import Callable
 from typing import final, override
 
+from graphon.diagnostics import trace
 from graphon.entities.pause_reason import SchedulingPause
 from graphon.runtime.graph_runtime_state import GraphExecutionProtocol
 from graphon.runtime.variable_pool import VariablePool
@@ -29,9 +30,29 @@ class AbortCommandHandler(CommandHandler[AbortCommand]):
     ) -> None:
         reason = command.reason or "User requested abort"
         logger.debug("Aborting workflow %s: %s", execution.workflow_id, reason)
+        trace(
+            "abort_handler_enter",
+            execution_id=id(execution),
+            workflow_id=execution.workflow_id,
+            has_propagation_callback=self._on_abort is not None,
+        )
         execution.abort(reason)
+        trace(
+            "abort_state_set",
+            execution_id=id(execution),
+            aborted=getattr(execution, "aborted", None),
+        )
         if self._on_abort is not None:
-            self._on_abort(reason)
+            try:
+                self._on_abort(reason)
+            except Exception as error:
+                trace(
+                    "abort_handler_failed",
+                    execution_id=id(execution),
+                    error_type=type(error).__name__,
+                )
+                raise
+        trace("abort_handler_done", execution_id=id(execution))
 
 
 @final

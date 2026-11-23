@@ -10,6 +10,7 @@ import threading
 from contextlib import AbstractContextManager
 from typing import final
 
+from graphon.diagnostics import trace
 from graphon.graph.graph import Graph
 from graphon.graph_events.base import GraphNodeEventBase
 from graphon.runtime.graph_runtime_state import GraphExecutionProtocol
@@ -113,6 +114,7 @@ class WorkerPool:
 
     def stop(self) -> None:
         """Stop all workers in the pool."""
+        join_results: list[tuple[int, str, int | None, bool]] = []
         with self._lock:
             self._running = False
             worker_count = len(self._workers)
@@ -128,8 +130,21 @@ class WorkerPool:
             for worker in self._workers:
                 if worker.is_alive():
                     worker.join(timeout=2.0)
+                join_results.append(
+                    (worker.worker_id, worker.name, worker.ident, worker.is_alive()),
+                )
 
             self._workers.clear()
+
+        for worker_id, name, ident, alive in join_results:
+            trace(
+                "thread_join_result",
+                role="worker",
+                worker_id=worker_id,
+                thread_name=name,
+                thread_ident=ident,
+                alive_after=alive,
+            )
 
     def _create_worker(self) -> None:
         """Create and start a new worker."""
@@ -147,6 +162,13 @@ class WorkerPool:
         )
 
         worker.start()
+        trace(
+            "thread_start_requested",
+            role="worker",
+            worker_id=worker.worker_id,
+            thread_name=worker.name,
+            thread_ident=worker.ident,
+        )
         self._workers.append(worker)
 
     def _remove_worker(self, worker: Worker) -> None:

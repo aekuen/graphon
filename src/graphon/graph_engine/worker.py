@@ -13,6 +13,7 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from typing import final, override
 
+from graphon.diagnostics import trace
 from graphon.enums import WorkflowNodeExecutionStatus
 from graphon.graph.graph import Graph
 from graphon.graph_engine.layers.base import GraphEngineLayer
@@ -92,6 +93,14 @@ class Worker(threading.Thread):
         try:
             for event in node_events:
                 if self._is_aborted():
+                    trace(
+                        "worker_abort_observed",
+                        worker_id=self._worker_id,
+                        execution_id=id(self._graph_execution)
+                        if self._graph_execution is not None
+                        else None,
+                        checkpoint="node_event_loop",
+                    )
                     break
                 if (
                     isinstance(event, NodeRunStartedEvent)
@@ -129,8 +138,24 @@ class Worker(threading.Thread):
         Continuously pulls node IDs from ready_queue, executes them,
         and pushes events to event_queue until stopped.
         """
+        trace(
+            "thread_enter",
+            role="worker",
+            worker_id=self._worker_id,
+            execution_id=id(self._graph_execution)
+            if self._graph_execution is not None
+            else None,
+        )
         while not self._stop_event.is_set():
             if self._is_aborted():
+                trace(
+                    "worker_abort_observed",
+                    worker_id=self._worker_id,
+                    execution_id=id(self._graph_execution)
+                    if self._graph_execution is not None
+                    else None,
+                    checkpoint="worker_loop",
+                )
                 break
             # Try to get a node ID from the ready queue (with timeout)
             try:
@@ -158,6 +183,15 @@ class Worker(threading.Thread):
                 )
             finally:
                 self._current_node_started_at = None
+
+        trace(
+            "thread_target_exit",
+            role="worker",
+            worker_id=self._worker_id,
+            execution_id=id(self._graph_execution)
+            if self._graph_execution is not None
+            else None,
+        )
 
     def _execute_node(self, node: Node) -> None:
         """Execute a single node and handle its events.

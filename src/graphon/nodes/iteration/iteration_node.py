@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, NewType, assert_never, override
 
 from typing_extensions import TypeIs
 
+from graphon.diagnostics import trace
 from graphon.entities.graph_config import NodeConfigDictAdapter
 from graphon.entities.graph_init_params import GraphInitParams
 from graphon.enums import (
@@ -452,10 +453,38 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
             with started_child_engines_lock:
                 aborted_reasons[index] = reason
                 graph_engine = started_child_engines.get(index)
+                graph_execution = (
+                    getattr(graph_engine, "_graph_execution", None)
+                    if graph_engine is not None
+                    else None
+                )
+                trace(
+                    "child_abort_targeted",
+                    container_execution_id=id(self),
+                    iteration_index=index,
+                    child_engine_id=id(graph_engine)
+                    if graph_engine is not None
+                    else None,
+                    child_execution_id=id(graph_execution)
+                    if graph_execution is not None
+                    else None,
+                    propagation="iteration_sibling",
+                )
                 if graph_engine is not None:
                     graph_engine.request_abort(reason)
 
-            future.cancel()
+            trace(
+                "future_cancel_attempt",
+                container_execution_id=id(self),
+                iteration_index=index,
+            )
+            cancelled = future.cancel()
+            trace(
+                "future_cancel_result",
+                container_execution_id=id(self),
+                iteration_index=index,
+                cancelled=cancelled,
+            )
 
     def _drain_parallel_siblings(
         self,
@@ -471,23 +500,51 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
         usage_accumulator: list[LLMUsage],
         merged_usage_indexes: set[int],
     ) -> None:
+        trace("sibling_drain_begin", container_execution_id=id(self))
         for future, index in future_to_index.items():
             if future == current_future:
                 continue
             if future.cancelled():
                 continue
 
+            graph_engine = started_child_engines.get(index)
+            graph_execution = (
+                getattr(graph_engine, "_graph_execution", None)
+                if graph_engine is not None
+                else None
+            )
+            trace(
+                "sibling_wait_begin",
+                container_execution_id=id(self),
+                iteration_index=index,
+                child_engine_id=id(graph_engine) if graph_engine is not None else None,
+                child_execution_id=id(graph_execution)
+                if graph_execution is not None
+                else None,
+            )
             with suppress(Exception):
                 future.result()
+            trace(
+                "sibling_wait_end",
+                container_execution_id=id(self),
+                iteration_index=index,
+            )
 
             if index in merged_usage_indexes:
                 continue
 
             self._merge_graph_engine_usage(
                 usage_accumulator=usage_accumulator,
-                graph_engine=started_child_engines.get(index),
+                graph_engine=graph_engine,
             )
             merged_usage_indexes.add(index)
+            trace(
+                "usage_merge_done",
+                container_execution_id=id(self),
+                iteration_index=index,
+                merged_indexes=len(merged_usage_indexes),
+            )
+        trace("sibling_drain_end", container_execution_id=id(self))
 
     def _execute_tracked_iteration_parallel(
         self,
@@ -498,13 +555,30 @@ class IterationNode(LLMUsageTrackingMixin, Node[IterationNodeData]):
         started_child_engines_lock: Lock,
         aborted_reasons: dict[int, str],
     ) -> tuple[float, list[GraphNodeEventBase], object | None, LLMUsage]:
+        trace(
+            "iteration_task_enter",
+            container_execution_id=id(self),
+            iteration_index=index,
+        )
         graph_engine = self._create_graph_engine(index, item)
         with started_child_engines_lock:
             started_child_engines[index] = graph_engine
             aborted_reason = aborted_reasons.get(index)
+            late_abort = aborted_reason is not None
             if aborted_reason is not None:
                 graph_engine.request_abort(aborted_reason)
 
+        graph_execution = getattr(graph_engine, "_graph_execution", None)
+        trace(
+            "iteration_child_bound",
+            container_execution_id=id(self),
+            iteration_index=index,
+            child_engine_id=id(graph_engine),
+            child_execution_id=id(graph_execution)
+            if graph_execution is not None
+            else None,
+            late_abort_pending=late_abort,
+        )
         return self._execute_parallel_iteration_with_graph_engine(
             graph_engine=graph_engine,
         )

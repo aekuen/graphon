@@ -6,6 +6,7 @@ import threading
 import time
 from typing import final
 
+from graphon.diagnostics import trace
 from graphon.graph_events.base import GraphNodeEventBase
 from graphon.graph_events.node import (
     NodeRunExceptionEvent,
@@ -74,16 +75,31 @@ class Dispatcher:
             daemon=True,
         )
         self._thread.start()
+        trace(
+            "thread_start_requested",
+            role="dispatcher",
+            thread_name=self._thread.name,
+            thread_ident=self._thread.ident,
+        )
 
     def stop(self) -> None:
         """Stop the dispatcher thread."""
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        if self._thread is not None:
+            trace(
+                "thread_join_result",
+                role="dispatcher",
+                thread_name=self._thread.name,
+                thread_ident=self._thread.ident,
+                alive_after=self._thread.is_alive(),
+            )
 
     def _dispatcher_loop(self) -> None:
         """Main dispatcher loop."""
         try:
+            trace("thread_enter", role="dispatcher")
             self._process_commands()
             paused = False
             while not self._stop_event.is_set():
@@ -91,6 +107,8 @@ class Dispatcher:
                     self._execution_coordinator.aborted
                     or self._execution_coordinator.execution_complete
                 ):
+                    if self._execution_coordinator.aborted:
+                        trace("dispatcher_abort_observed", role="dispatcher")
                     break
                 if self._execution_coordinator.paused:
                     paused = True
@@ -120,6 +138,7 @@ class Dispatcher:
             # Signal the event emitter that execution is complete
             if self._event_emitter:
                 self._event_emitter.mark_complete()
+            trace("thread_target_exit", role="dispatcher")
 
     def _process_commands(self, event: GraphNodeEventBase | None = None) -> None:
         if event is None or isinstance(event, self._COMMAND_TRIGGER_EVENTS):

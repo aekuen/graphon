@@ -13,6 +13,7 @@ from weakref import WeakSet
 from pydantic import BaseModel, Field
 from pydantic_core import to_jsonable_python
 
+from graphon.diagnostics import trace
 from graphon.enums import NodeExecutionType, NodeState, NodeType
 from graphon.model_runtime.entities.llm_entities import LLMUsage
 from graphon.runtime.variable_pool import VariablePool
@@ -509,6 +510,18 @@ class _GraphRuntimeBindings:
             self._child_abort_reason = reason
             children = tuple(self._child_engines)
         for child in children:
+            child_execution = getattr(child, "_graph_execution", None)
+            trace(
+                "child_abort_targeted",
+                parent_execution_id=id(
+                    getattr(self._runtime_state, "graph_execution", None)
+                ),
+                child_engine_id=id(child),
+                child_execution_id=id(child_execution)
+                if child_execution is not None
+                else None,
+                propagation="existing_child",
+            )
             request_abort = getattr(child, "request_abort", None)
             if callable(request_abort):
                 request_abort(reason)
@@ -534,7 +547,29 @@ class _GraphRuntimeBindings:
         )
         with self._child_engines_lock:
             self._child_engines.add(child_engine)
+            child_execution = getattr(child_engine, "_graph_execution", None)
+            trace(
+                "child_registered",
+                parent_execution_id=id(
+                    getattr(self._runtime_state, "graph_execution", None)
+                ),
+                child_engine_id=id(child_engine),
+                child_execution_id=id(child_execution)
+                if child_execution is not None
+                else None,
+                late_abort_pending=self._child_abort_reason is not None,
+            )
             if self._child_abort_reason is not None:
+                trace(
+                    "late_child_abort_targeted",
+                    parent_execution_id=id(
+                        getattr(self._runtime_state, "graph_execution", None)
+                    ),
+                    child_engine_id=id(child_engine),
+                    child_execution_id=id(child_execution)
+                    if child_execution is not None
+                    else None,
+                )
                 child_engine.request_abort(self._child_abort_reason)
         return child_engine
 
