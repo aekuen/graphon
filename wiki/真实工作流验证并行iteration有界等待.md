@@ -298,7 +298,157 @@ grep '"session_id": "<本次 session>"' \
 
 **拿抓栈窗口当产品 SLA。** 之前诊断方案里的 5 秒、30 秒观察窗口只是人工排查用。真正控制失败时机的是 `GRAPHON_PARALLEL_ITERATION_WAIT_TIMEOUT` 和 `GRAPHON_PARALLEL_SIBLING_DRAIN_TIMEOUT`。
 
-## 11. 查阅位置
+## 11. 后台子图没返回怎么查
+
+父 iteration 超时后不会再等这些 child Future。排查时按日志走，不要只看 workflow 页面。页面只能说明父节点失败了，说明不了哪些 child 没回来。
+
+### 11.1 锁定本次 workflow 的日志和 session
+
+```bash
+LOG=/home/jackson/graphon/debug/graphon_trace.realworkflow.jsonl
+
+grep -n '"event": "trace_configured"' "$LOG" | tail -20
+```
+
+一次 workflow 对应一个 `session_id`。拿到本次 session 后存到变量里：
+
+```bash
+SESSION=$(grep '"event": "trace_configured"' "$LOG" | tail -1 \
+  | grep -o '"session_id": "[0-9a-f]*"' | cut -d'"' -f4)
+
+echo "$SESSION"
+```
+
+如果日志里有多次运行，别把不同 `session_id` 的事件混在一起看。
+
+### 11.2 先找超时锚点，拿到 pending index
+
+主等待超时看 `parallel_wait_timeout`，drain 超时看 `sibling_wait_timeout` 和 `sibling_drain_timeout`：
+
+```bash
+grep -F "\"session_id\": \"$SESSION\"" "$LOG" | \
+  grep -E '"event": "(parallel_wait_timeout|sibling_wait_timeout|sibling_drain_timeout)"'
+```
+
+想看得清楚一点，可以用 Python 只打印关键字段：
+
+```bash
+python3 - "$LOG" "$SESSION" <<'PY'
+import json
+import sys
+
+path, session = sys.argv[1:]
+wanted = {"parallel_wait_timeout", "sibling_wait_timeout", "sibling_drain_timeout"}
+keys = (
+    "iteration_index",
+    "pending_indexes",
+    "pending_count",
+    "completed_indexes",
+    "merged_indexes",
+    "container_execution_id",
+    "child_engine_id",
+    "child_execution_id",
+    "cancelled",
+    "abort_requested",
+    "timeout_seconds",
+    "elapsed_seconds",
+)
+
+with open(path, encoding="utf-8") as file:
+    for line in file:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("session_id") != session or record.get("event") not in wanted:
+            continue
+        fields = {key: record[key] for key in keys if key in record}
+        print(record["sequence"], record["event"], fields)
+PY
+```
+
+看这几项：
+
+- `parallel_wait_timeout.pending_indexes`：主等待截止时还没完成的 item。
+- `sibling_wait_timeout.iteration_index`：drain 截止时还在等的那个 item，这条事件已经带 child id。
+- `sibling_drain_timeout.pending_indexes`：drain 超时时仍未完成的一组 item。
+- `sibling_drain_timeout.completed_indexes`：已经完成、已经入账的 item。
+
+`pending_indexes` 是判断“哪些子图没返回”的第一依据。不要只靠缺少 `sibling_wait_end` 反推，cancelled Future 也不会写 `sibling_wait_end`。
+
+### 11.3 把 index 对应到 child engine / child execution
+
+拿到 index 后，用 `iteration_child_bound` 或 `child_abort_targeted` 找它对应的 child：
+
+```bash
+INDEX=3
+
+grep -F "\"session_id\": \"$SESSION\"" "$LOG" | \
+  grep -E '"event": "(iteration_task_enter|iteration_child_bound|child_abort_targeted|sibling_wait_begin|sibling_wait_end|sibling_wait_timeout|usage_merge_done)"' | \
+  grep -F "\"iteration_index\": $INDEX"
+```
+
+重点看：
+
+- `iteration_child_bound`：index 对应的 `child_engine_id`、`child_execution_id`，以及是否有 `late_abort_pending=true`。
+- `child_abort_targeted`：这个 child 有没有被列为 abort 目标，以及 `propagation` 是 `iteration_sibling` 还是 `iteration_wait_timeout`。
+- `sibling_wait_timeout`：drain 超时时这个 index 的 child id、cancelled 状态、abort 状态。
+- `sibling_wait_end` / `usage_merge_done`：这个 index 是否在父 iteration 结束前已经入账。
+
+主等待超时时，`parallel_wait_timeout` 只有 `pending_indexes`，没有 child id。用同一个 `container_execution_id` 和 `iteration_index` 去找紧随其后的 `child_abort_targeted`，就能补上 child id。
+
+### 11.4 查 child 后来有没有退出
+
+父侧事件用 `child_execution_id`，child 自己的事件用 `execution_id`。两个字段都要搜：
+
+```bash
+CHILD_EXEC=<上一步查到的 child_execution_id>
+
+grep -F "\"session_id\": \"$SESSION\"" "$LOG" | \
+  grep -F "\"execution_id\": $CHILD_EXEC" | \
+  grep -E '"event": "(abort_send_attempt|abort_enqueue_ok|terminal_emitted|run_cleanup_enter|run_cleanup_done|worker_abort_observed|thread_target_exit|thread_join_result)"'
+```
+
+再查一次 `child_execution_id`，防止只看到父侧记录：
+
+```bash
+grep -F "\"session_id\": \"$SESSION\"" "$LOG" | \
+  grep -F "\"child_execution_id\": $CHILD_EXEC"
+```
+
+如果 child id 没拿到，但拿到了 engine id：
+
+```bash
+CHILD_ENGINE=<上一步查到的 child_engine_id>
+
+grep -F "\"session_id\": \"$SESSION\"" "$LOG" | \
+  grep -E "\"(engine_id|child_engine_id)\": $CHILD_ENGINE"
+```
+
+判断口径：
+
+- 有 `abort_send_attempt`、`abort_enqueue_ok`：abort 命令确实入队了。
+- 有 `worker_abort_observed`：worker 在某个检查点看到了 abort。
+- 有 `terminal_emitted`：child 发出了终态事件。
+- 有 `run_cleanup_done`：child 的收尾跑完了。
+- 有 `thread_target_exit`、`thread_join_result`：线程退出和 join 有记录。
+
+只有 `child_abort_targeted`，后面没有 `terminal_emitted` / `run_cleanup_done` / `thread_target_exit`，就把这个 child 记为“后台未确认退出”。不要写成“已停止”。
+
+如果 `child_execution_id` 是 `null` 或还没登记，说明 abort 来得太早，child 当时还没创建出执行对象。这种场景继续查 `iteration_task_enter`、`iteration_child_bound`、`child_registered`、`late_child_abort_targeted`，确认登记后有没有补发 abort。
+
+### 11.5 快速判定
+
+| 日志现象 | 结论 |
+|---|---|
+| `parallel_wait_timeout.pending_indexes` 有值 | 主等待截止时这些 item 没完成 |
+| `sibling_wait_timeout` 有对应 index 和 child id | drain 截止时这个 child 还没返回 |
+| `child_abort_targeted` 有记录，后面没有终态和清理 | child 被要求中止，但未确认退出 |
+| `terminal_emitted` + `run_cleanup_done` + `thread_target_exit` 都出现 | child 后来完成了收尾，只是错过了父 iteration 的预算 |
+| `future_cancel_result.cancelled=false` | Future 已经在跑，cancel 没停下它；继续看 abort 链路 |
+| `usage_merge_done` 里没有该 index | 未返回 child 的 usage 没有并进父 iteration，符合语义 A |
+
+## 12. 查阅位置
 
 - `src/graphon/nodes/iteration/iteration_node.py`：主等待 `L279-L372`，abort helper `L505-L592`，主等待超时 `L594-L620`，drain `L622-L731`，drain 超时 `L733-L773`
 - `src/graphon/nodes/iteration/exc.py`：`L32-L53`
