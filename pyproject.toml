@@ -1,6 +1,6 @@
 [project]
 name = 'graphon'
-version = "0.4.0"
+version = "0.4.1"
 description = 'Graph execution engine for agentic AI workflows.'
 readme = 'README.md'
 license = 'Apache-2.0'
@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-source = 'https://github.com/langgenius/graphon'
-homepage = 'https://github.com/langgenius/graphon'
-issues = 'https://github.com/langgenius/graphon/issues'
+source = 'https://github.com/aekuen/graphon'
+homepage = 'https://github.com/aekuen/graphon'
+issues = 'https://github.com/aekuen/graphon/issues'
 
 [dependency-groups]
 dev = [
