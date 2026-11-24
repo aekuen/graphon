@@ -355,26 +355,30 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 ### 8.1.2 断点清单：按一次验证的顺序设置
 
+下表中的行号对应本轮有界等待修复后的当前源码。旧清单里 `_drain_parallel_siblings()` 的逐 Future `result()` 断点已经不存在，主等待和 drain 都改成了有界 `wait()`。
+
 | 顺序 | 文件与位置 | 停止时机 / 目的 | 当前帧可用对象 |
 |---|---|---|---|
-| 1 | `graph_engine.py`，`GraphEngine.run()`，调用 `_start_execution()` 之后 | 记录父 engine 及 graph execution 身份；不是在 started 事件 yield 处 | `self` 为 engine |
-| 2 | `worker_management/worker_pool.py`，第 150 行 | `worker.start()` 已返回；记录线程身份，但还需目标函数入口确认 | `worker`、`self` 为 pool |
-| 3 | `worker.py`，`Worker.run()` 首个可执行语句 | 确认 worker 实际进入 | `self` 为 Worker |
-| 4 | `orchestration/dispatcher.py`，第 87 行 | 确认 dispatcher 已进入主循环 | `self` 为 Dispatcher |
-| 5 | `nodes/iteration/iteration_node.py`，第 508 行 | 已完成 index→child 登记并释放登记锁，记录对应关系 | `index`、`graph_engine` |
-| 6 | `graph_engine.py`，第 227 行 | 确认向哪个 engine 发 abort；此时尚未完成发送 | `self` 为目标 engine |
-| 7 | `command_processing/command_handlers.py`，第 33 行 | `execution.abort(reason)` 已执行，分别观察父图与子图 | `execution`、`command`、`self` 为 handler |
-| 8 | `runtime/graph_runtime_state.py`，第 511 行 | 已记录 abort 原因并取得当前 child 快照，锁已释放 | `children`、`self` 为 bindings |
-| 9 | 同文件第 514 行 | 当前 child 即将收到发送请求；不是已处理确认 | `child` |
-| 10 | 同文件第 538 行 | 命中晚登记补发分支；此处仍持登记锁，只短暂停留或用 logpoint | `child_engine` |
-| 11 | `worker.py`，`_consume_node_events()` 的 abort 分支内部 | 确认 worker 实际观察到 abort，勿只断在每次条件检查前 | `self` 为 Worker |
-| 12 | `orchestration/dispatcher.py`，第 94 行 | 停止分支命中；还需区分 aborted 与 execution_complete | `self._execution_coordinator` |
-| 13 | `graph_engine.py`，`_emit_terminal_events()` 的 aborted 分支 | 确认图交付 abort 终态；尚不能证明清理完成 | `self` 为 engine |
-| 14 | `worker_management/worker_pool.py`，第 132 行 | 所有既有 join 已返回，列表尚未清空，检查仍存活 worker | `self._workers` |
-| 15 | `nodes/iteration/iteration_node.py`，第 481 行 | 即将等待某个 sibling Future，记录被等待的 index | `index`、`future`、`started_child_engines` |
-| 16 | 同文件第 483 行 | 该次 `result()` 已返回或异常被抑制，不代表调用成功 | 同上 |
+| 1 | `graph_engine.py:303`，`GraphEngine.run()` | `_start_execution()` 已返回，准备进入事件交付；不是 started 事件 yield 处 | `self` 为 engine |
+| 2 | `worker_management/worker_pool.py:165`，`WorkerPool._create_worker()` | `worker.start()` 已返回；记录线程身份，仍须由第 3 项确认目标函数进入 | `worker`、`worker_id`、`self` 为 pool |
+| 3 | `worker.py:141`，`Worker.run()` | `thread_enter` 位置，确认 worker 实际进入 | `self` 为 Worker |
+| 4 | `orchestration/dispatcher.py:102`，`Dispatcher._dispatcher_loop()` | `thread_enter` 位置，确认 dispatcher 主循环进入 | `self` 为 Dispatcher |
+| 5 | `nodes/iteration/iteration_node.py:798`，`_execute_tracked_iteration_parallel()` | index→child 已登记并释放锁，`iteration_child_bound` 即将记录 | `index`、`graph_engine`、`aborted_reason`、`self` 为 IterationNode |
+| 6 | `graph_engine.py:241`，`GraphEngine.request_abort()` | abort 发送调用行，尚未完成发送 | `self` 为目标 engine、`reason`、`self._command_channel` |
+| 7 | `command_processing/command_handlers.py:40`，`AbortCommandHandler.handle()` | `execution.abort(reason)` 已执行，`abort_state_set` 即将记录 | `execution`、`command`、`self` 为 handler |
+| 8 | `runtime/graph_runtime_state.py:512`，`abort_children()` | 已记录 abort 原因并取得 child 快照，锁已释放 | `children`、`reason`、`self` 为 bindings |
+| 9 | `runtime/graph_runtime_state.py:527`，`abort_children()` | 当前 child 即将收到 `request_abort()`；不是已处理确认 | `child`、`child_execution`、`request_abort`、`reason` |
+| 10 | `runtime/graph_runtime_state.py:573`，`create_child_engine()` | 命中晚登记补发分支；仍持登记锁，只短暂停留或用 logpoint | `child_engine`、`self._child_abort_reason` |
+| 11 | `worker.py:96`，`_consume_node_events()` abort 分支 | `worker_abort_observed` 即将记录，确认 worker 在事件循环中观察到 abort | `self` 为 Worker、`node`、`event` |
+| 12 | `orchestration/dispatcher.py:111`，`_dispatcher_loop()` | `dispatcher_abort_observed` 位置；区别于 execution_complete | `self`、`self._execution_coordinator` |
+| 13 | `graph_engine.py:351`，`_emit_terminal_events()` | aborted 分支构造终态事件；尚不能证明清理完成 | `self` 为 engine、`abort_reason` |
+| 14 | `worker_management/worker_pool.py:137`，`WorkerPool.stop()` | 所有既有 join 已返回，列表尚未清空，检查仍存活 worker | `self._workers`、`join_results` |
+| 15 | `nodes/iteration/iteration_node.py:326`，`_execute_parallel_iterations()` | 主 iteration 有界 `wait()`，记录仍在等待的 index | `pending_future_to_index`、`timeout_seconds`、`remaining_seconds` |
+| 16 | 同文件第 317 行 | 主等待预算耗尽，即将记录 `parallel_wait_timeout` | `pending_future_to_index`、`elapsed_seconds`、`timeout_seconds` |
+| 17 | `nodes/iteration/iteration_node.py:677`，`_drain_parallel_siblings()` | sibling drain 有界 `wait()`，记录本轮仍在等待的 index | `pending_future_to_index`、`completed_indexes`、`timeout_seconds` |
+| 18 | 同文件第 683 行 | drain 超时分支，即将记录 `sibling_wait_timeout` / `sibling_drain_timeout` | `pending_future_to_index`、`merged_usage_indexes`、`completed_indexes` |
 
-最小组合先设置第 5、7、8、13、14、15 项；遇到发送或启动问题再启用其他断点。若要确认 dispatcher join 后状态，在 `Dispatcher.stop()` 的调用方、该调用返回后的下一条语句检查对应 thread；不要把第 82 行 join 执行前当作返回后。
+最小组合先设置第 1、5、7、8、13、14、15、17 项；验证超时路径时再启用第 16、18 项。遇到发送或启动问题再启用其他断点。若要确认 dispatcher join 后状态，在 `Dispatcher.stop()` 的 `join()` 返回后检查对应 thread；不要把 join 执行前当作返回后。
 
 ### 8.1.3 第一步：记录父 engine 与 child 映射
 
@@ -384,14 +388,14 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 - `id(self._graph_execution)`：父 execution ID。
 - `(self._graph_execution.aborted, self._graph_execution.completed)`：当前状态。
 
-选中 **`_execute_tracked_iteration_parallel()` 第 508 行帧**：
+选中 **`_execute_tracked_iteration_parallel()` 第 798 行帧**：
 
 - `(index, id(graph_engine), id(graph_engine._graph_execution))`
 - `(graph_engine._graph_execution.aborted, graph_engine._graph_execution.completed)`
 
 把每个 index 对应的 engine/execution ID 记到外部笔记。不要把多个 engine 保存进调试器全局变量长期持有，否则会改变弱引用注册表的回收时机。
 
-在 **`AbortCommandHandler.handle()` 第 33 行**设置条件断点：`id(execution) == 123456789`。将数字替换为刚记录的目标 execution ID。父图和子图分别核实；不能在这里使用 `self._graph_execution`，因为 `self` 是 handler。
+在 **`AbortCommandHandler.handle()` 第 40 行**设置条件断点：`id(execution) == 123456789`。将数字替换为刚记录的目标 execution ID。父图和子图分别核实；不能在这里使用 `self._graph_execution`，因为 `self` 是 handler。
 
 ### 8.1.4 第二步：从控制台发送 abort
 
@@ -403,7 +407,7 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 这里 `self` 必须是 `GraphEngine`。别在 `GraphWorker-N.run` 帧执行这句；那个帧里的 `self` 是 `Worker`，没有 `request_abort()`，IDE 会报 `AttributeError: 'Worker' object has no attribute 'request_abort'`。
 
-**方式 B：只对某个 child 发请求。** 在 `_execute_tracked_iteration_parallel()` 第 508 行帧，核对 `index` 和 `id(graph_engine)` 后执行：
+**方式 B：只对某个 child 发请求。** 在 `_execute_tracked_iteration_parallel()` 第 798 行帧，核对 `index` 和 `id(graph_engine)` 后执行：
 
 `graph_engine.request_abort("debug-child-abort")`
 
@@ -419,27 +423,27 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 ### 8.1.5 第三步：检查哪些子图被发送、哪些已处理
 
-在 **bindings 的 `abort_children()` 第 511 行**，`children` 已是锁内生成的 tuple，可读取：
+在 **bindings 的 `abort_children()` 第 512 行**，`children` 已是锁内生成的 tuple，可读取：
 
 - `[(id(c), id(c._graph_execution), c._graph_execution.aborted, c._graph_execution.completed) for c in children]`
 - `self._child_abort_reason is not None`
 
 此时扇出循环尚未执行，因此 children 中 aborted=False 完全可能是正常现象。此列表不包含未来才登记的 child，也不能被当作全历史子图列表。
 
-在 **第 514 行**：
+在 **第 527 行**：
 
 - `(id(child), id(child._graph_execution))`
 
-在 **晚登记分支第 538 行**：
+在 **晚登记分支第 573 行**：
 
 - `(id(child_engine), id(child_engine._graph_execution), self._child_abort_reason is not None)`
 
-在 **目标 child 的 handler 第 33 行**：
+在 **目标 child 的 handler 第 40 行**：
 
 - `(id(execution), execution.aborted, execution.completed)`
 - `self._on_abort is not None`
 
-第 33 行的 `execution.aborted == True` 是该 child 已处理请求的直接证据；接下来的回调是否成功、嵌套 child 是否处理，还要继续观察。不要输出完整 command/reason/error，避免敏感内容泄漏。
+第 40 行的 `execution.aborted == True` 是该 child 已处理请求的直接证据；接下来的回调是否成功、嵌套 child 是否处理，还要继续观察。不要输出完整 command/reason/error，避免敏感内容泄漏。
 
 ### 8.1.6 第四步：确认工作线程是否真的停止
 
@@ -448,7 +452,7 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 - `(id(self), self.name, self.ident, self.native_id)`
 - `(id(self._graph_execution), self._is_aborted())`
 
-在 **`WorkerPool.stop()` 第 132 行，执行 clear 之前**：
+在 **`WorkerPool.stop()` 第 137 行，执行 clear 之前**：
 
 - `[(id(w), w.name, w.ident, w.native_id, w.is_alive()) for w in self._workers]`
 
@@ -466,16 +470,21 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 此操作会获取 threading 内部锁，仅作可选辅助；若其他线程被暂停在相关锁内，求值可能阻塞。重复线程名不能证明它属于哪个 child，必须结合此前记录的 ident/线程实例。活线程列表缺项也不能代替完整的退出历史。
 
-### 8.1.7 第五步：定位 sibling drain 卡在哪个 index
+### 8.1.7 第五步：定位 sibling drain 卡在哪些 index
 
-在 **`_drain_parallel_siblings()` 第 481 行**：
+当前 `_drain_parallel_siblings()` 不再逐个调用无超时的 `result()`，停在第 677 行的有界 `wait()` 前，先读取本轮仍在等待的集合：
 
-- `index`
-- `id(future)`
-- `None if started_child_engines.get(index) is None else (id(started_child_engines[index]), id(started_child_engines[index]._graph_execution), started_child_engines[index]._graph_execution.aborted, started_child_engines[index]._graph_execution.completed)`
-- `index in merged_usage_indexes`
+- `sorted(pending_future_to_index.values())`
+- `completed_indexes`
+- `timeout_seconds`
+- `remaining_seconds`
 
-继续执行，观察是否命中同一 index 的第 483 行。未命中时，结合其他线程栈判断 child 是否仍阻塞；第 483 行命中只证明等待已经结束或异常被抑制。
+需要把 index 对应到 child 时，用当前局部映射只读查询：
+
+- `[(index, id(started_child_engines.get(index)) if started_child_engines.get(index) is not None else None) for index in sorted(pending_future_to_index.values())]`
+- `sorted(merged_usage_indexes)`
+
+若第 683 行的 drain 超时分支命中，记录 `pending_future_to_index`、`completed_indexes`、`merged_usage_indexes`、`timeout_seconds`。未完成的 index 不会写 `sibling_wait_end`，也不会合并 usage。若第 693 行取到 `done`，说明这一批 Future 已经结束，可以记录 `index`、`completed_indexes` 和 `merged_usage_indexes`，但命中不等于调用成功。
 
 **不要在控制台执行 `future.result()`、`join()`、`wait()` 或获取业务锁。** 这些操作可能使调试器求值线程等待被暂停的线程。也不要默认调用 `future.done()`/`cancelled()`：它们会获取 Future 内部锁；尤其在暂停所有线程的场景可能卡住。优先查看已有局部值、真实执行路径及线程栈。
 
@@ -487,7 +496,7 @@ child runtime 登记时不一定持有 iteration index，因此要通过 `iterat
 
 1. 父请求是否真正进入 handler？
 2. 哪些 child 在扇出快照中，哪些通过晚登记补发？
-3. 哪些 child 自己的 handler 第 33 行被命中？
+3. 哪些 child 自己的 handler 第 40 行被命中？
 4. 哪些 child 只有终态，哪些已完成清理且 worker 停止？
 5. 未退出 child 当前卡在哪个线程/调用，drain 正在等哪个 index？
 
